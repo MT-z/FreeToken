@@ -541,6 +541,28 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--swa-num-pages-override",
+        type=int,
+        default=ServerArgs.swa_num_pages_override,
+        help=(
+            "Pin the sliding-window pool to this many pages instead of deriving it from "
+            "--swa-full-tokens-ratio. Raises the window a single sequence can hold (and so "
+            "the longest prompt an unchunkable multimodal request can use) without "
+            "inflating the full-attention pool."
+        ),
+    )
+
+    parser.add_argument(
+        "--swa-full-tokens-ratio",
+        type=float,
+        default=ServerArgs.swa_full_tokens_ratio,
+        help=(
+            "Sliding-window pool size as a fraction of the full-attention pool "
+            "(default 0.2). Ignored when --swa-num-pages-override is set."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cache-policy",
         default=ServerArgs.moe_cache_policy,
         choices=["lru"],
