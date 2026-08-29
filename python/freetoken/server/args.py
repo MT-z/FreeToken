@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import re
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Tuple
 
 import torch
@@ -33,6 +33,12 @@ class ServerArgs(SchedulerConfig):
     # Build and load the checkpoint's vision tower (--vision). Off by default: it is ~0.8 GiB
     # of resident bf16 that text-only serving never reads.
     vision: bool = False
+    # Per-key overrides layered on top of whatever --sampling-defaults resolved. A
+    # generation_config.json carries ONE recommendation, but a model card often gives several
+    # (Ornith-1.5: temperature 1.0 general, 0.6 for precise coding) -- and a client that sends
+    # no sampling fields at all (the claude CLI sends only model/max_tokens/stream/messages)
+    # has no way to pick. This is where a deployment states which one it is serving.
+    sampling_override: dict = field(default_factory=dict)
     # Default max output (decode) tokens for a request that omits one. None falls back to the
     # adapter's built-in default (32k).
     max_output_tokens: int | None = None
@@ -444,6 +450,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--sampling-override",
+        action="append",
+        metavar="KEY=VALUE",
+        default=None,
+        help=(
+            "Override a default sampling param on top of --sampling-defaults, as KEY=VALUE "
+            "(repeatable). Keys: temperature, top_p, top_k. Only fills request fields the "
+            "client left unspecified. Example: --sampling-override temperature=0.6"
+        ),
+    )
+
+    parser.add_argument(
         "--served-model-name",
         type=str,
         default=ServerArgs.served_model_name,
@@ -708,6 +726,26 @@ def parse_args(
 
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
+
+    _SAMPLING_TYPES = {"temperature": float, "top_p": float, "top_k": int}
+    raw_overrides = kwargs.pop("sampling_override", None) or []
+    overrides: dict = {}
+    for item in raw_overrides:
+        key, sep, value = str(item).partition("=")
+        key = key.strip()
+        if not sep or key not in _SAMPLING_TYPES:
+            raise ValueError(
+                f"--sampling-override expects KEY=VALUE with KEY in "
+                f"{sorted(_SAMPLING_TYPES)}, got {item!r}"
+            )
+        try:
+            overrides[key] = _SAMPLING_TYPES[key](value.strip())
+        except ValueError:
+            raise ValueError(
+                f"--sampling-override {key}: expected "
+                f"{_SAMPLING_TYPES[key].__name__}, got {value.strip()!r}"
+            ) from None
+    kwargs["sampling_override"] = overrides
 
     if kwargs["served_model_name"] is None:
         kwargs["served_model_name"] = (

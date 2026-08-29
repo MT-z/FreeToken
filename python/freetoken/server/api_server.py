@@ -949,11 +949,17 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     set_vision_enabled(config.vision)
     if config.vision:
         logger.info("Vision enabled: the checkpoint's vision tower will be built and loaded")
+    # --sampling-override wins over the checkpoint's recommendation: generation_config.json
+    # holds one preset, and the model card's task-specific one (e.g. a lower temperature for
+    # coding) can only be selected here when the client sends no sampling fields of its own.
+    if config.sampling_override:
+        _MODEL_SAMPLING = {**_MODEL_SAMPLING, **config.sampling_override}
     # Always surface the effective default sampling (model-recommended where available,
     # else framework defaults), since unspecified request fields resolve to these.
     logger.info(
         "Default sampling config (source=%s): temperature=%s, top_k=%s, top_p=%s",
-        "model" if _MODEL_SAMPLING else "framework",
+        ("model+override" if config.sampling_override else "model")
+        if _MODEL_SAMPLING else "framework",
         _MODEL_SAMPLING.get("temperature", 0.0),
         _MODEL_SAMPLING.get("top_k", -1),
         _MODEL_SAMPLING.get("top_p", 1.0),
