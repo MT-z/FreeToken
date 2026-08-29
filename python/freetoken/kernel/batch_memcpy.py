@@ -28,6 +28,11 @@ def _probe(fn) -> None:
     src = torch.arange(16, dtype=torch.uint8).pin_memory()
     dst = torch.zeros(16, dtype=torch.uint8, device="cuda")
     stream = torch.cuda.Stream()
+    # dst is allocated AND zero-filled on the current stream, while the copy runs on this
+    # fresh one -- with no edge between them the fill can retire after the copy lands and
+    # wipe it, which reads back as "copied wrong bytes" and permanently disables hit-D2D for
+    # the process. Measured at 2/600 starts without this wait, 0/600 with it.
+    stream.wait_stream(torch.cuda.current_stream())
     fn(
         torch.tensor([dst.data_ptr()]),
         torch.tensor([src.data_ptr()]),

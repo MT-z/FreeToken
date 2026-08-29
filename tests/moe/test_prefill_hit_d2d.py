@@ -71,6 +71,9 @@ def test_batch_memcpy_roundtrip():
     src_ptrs = torch.tensor([src[p].data_ptr() for p in perm.tolist()], dtype=torch.int64)
     sizes = torch.full((rows,), feat, dtype=torch.int64)
     stream = torch.cuda.Stream()
+    # dst's zero-fill is on the current stream; without this edge it can land after the copy
+    # and wipe it (~0.3% of runs), which reads as a flaky failure rather than the race it is.
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         batch_memcpy_jit(dst_ptrs, src_ptrs, sizes, stream.cuda_stream)
     stream.synchronize()
