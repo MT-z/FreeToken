@@ -456,8 +456,10 @@ def parse_args(
         default=None,
         help=(
             "Override a default sampling param on top of --sampling-defaults, as KEY=VALUE "
-            "(repeatable). Keys: temperature, top_p, top_k. Only fills request fields the "
-            "client left unspecified. Example: --sampling-override temperature=0.6"
+            "(repeatable). Keys: temperature, top_p, top_k, presence_penalty. Only fills "
+            "request fields the client left unspecified; presence_penalty has no request "
+            "field at all, so this is the only way to set it. Example: "
+            "--sampling-override temperature=1.0 --sampling-override presence_penalty=1.5"
         ),
     )
 
@@ -727,7 +729,8 @@ def parse_args(
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
 
-    _SAMPLING_TYPES = {"temperature": float, "top_p": float, "top_k": int}
+    _SAMPLING_TYPES = {"temperature": float, "top_p": float, "top_k": int,
+                       "presence_penalty": float}
     raw_overrides = kwargs.pop("sampling_override", None) or []
     overrides: dict = {}
     for item in raw_overrides:

@@ -20,6 +20,12 @@ class SamplingParams:
     temperature: float = 0.0
     top_k: int = -1
     top_p: float = 1.0
+    # OpenAI presence penalty: a flat subtraction from the logit of every token this request
+    # has ALREADY GENERATED (the prompt is excluded -- penalizing a 100k-token agent prompt
+    # would cover most of the vocabulary and wreck the distribution). 0.0 disables it. Model
+    # cards pair a high temperature with this to keep it out of repetition loops; Ornith-1.5
+    # recommends 1.5 alongside temperature 1.0.
+    presence_penalty: float = 0.0
     ignore_eos: bool = False
     max_tokens: int = 1024
     # Stop strings (OpenAI `stop` / Anthropic `stop_sequences`). Generation finishes when one
@@ -72,6 +78,9 @@ class Req:
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
+        # Where this request's own output starts: everything from here on is what the
+        # presence penalty may act on (input_ids grows by one per append_host).
+        self.prompt_len = len(self.input_ids)
         self.device_len = len(self.input_ids)
         self.max_device_len = len(self.input_ids) + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len

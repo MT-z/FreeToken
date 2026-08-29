@@ -15,6 +15,11 @@ class BatchSamplingArgs:
     temperatures: torch.Tensor | None
     top_k: torch.Tensor | None = None
     top_p: torch.Tensor | None = None
+    # Presence penalty, when any request in the batch asked for one: ``penalties`` [bs] and
+    # ``seen`` [bs, vocab] (1.0 where that request has already emitted the token). Both None
+    # when no request wants it, so the common path allocates and computes nothing.
+    penalties: torch.Tensor | None = None
+    seen: torch.Tensor | None = None
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -55,10 +60,37 @@ class Sampler:
     device: torch.device
     vocab_size: int
 
+    def _presence(self, batch: Batch) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """``(penalties [bs], seen [bs, vocab])`` for the presence penalty, or ``(None, None)``.
+
+        ``seen`` is rebuilt each step rather than carried between them: at decode batch sizes
+        it is a few MB of scatter (~0.2% of a step) against having to track slot reuse,
+        aborts and finishes for a persistent per-request bitmap. Only tokens the request
+        itself generated count -- ``input_ids[:prompt_len]`` is the prompt.
+        """
+        pens = [r.sampling_params.presence_penalty for r in batch.reqs]
+        if not any(pens):
+            return None, None
+        gen = [r.input_ids[r.prompt_len:] for r in batch.reqs]
+        width = max((int(g.numel()) for g in gen), default=0)
+        if width == 0:  # nothing generated yet: no token can be a repeat
+            return None, None
+        # Pad with the sentinel column vocab_size, scatter, then drop it -- padding with a
+        # real id (0) would penalize that token for every short request in the batch.
+        idx = torch.full((len(gen), width), self.vocab_size, dtype=torch.int64)
+        for i, g in enumerate(gen):
+            idx[i, : g.numel()] = g.to(torch.int64)
+        idx = idx.pin_memory().to(self.device, non_blocking=True)
+        seen = torch.zeros((len(gen), self.vocab_size + 1), dtype=torch.float32,
+                           device=self.device)
+        seen.scatter_(1, idx, 1.0)
+        return make_device_tensor(pens, torch.float32, self.device), seen[:, : self.vocab_size]
+
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
         params = [r.sampling_params for r in batch.reqs]
+        penalties, seen = self._presence(batch)
         if all(p.is_greedy for p in params):
-            return BatchSamplingArgs(temperatures=None)
+            return BatchSamplingArgs(temperatures=None, penalties=penalties, seen=seen)
 
         MIN_P = MIN_T = 1e-6
         ts = [max(0.0 if p.is_greedy else p.temperature, MIN_T) for p in params]
@@ -70,11 +102,17 @@ class Sampler:
             top_k = make_device_tensor(top_ks, torch.int32, self.device)
         if any(p < 1.0 for p in top_ps):
             top_p = make_device_tensor(top_ps, torch.float32, self.device)
-        return BatchSamplingArgs(temperatures, top_k=top_k, top_p=top_p)
+        return BatchSamplingArgs(temperatures, top_k=top_k, top_p=top_p,
+                                 penalties=penalties, seen=seen)
 
     @nvtx_annotate("Sampler")
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         with torch.cuda.nvtx.range("Sampler"):
+            if args.penalties is not None:
+                # On the raw logits, before the temperature divide -- the penalty is a fixed
+                # logit offset, so scaling it by 1/temperature would make its strength depend
+                # on the temperature (OpenAI and vLLM both apply it here).
+                logits = logits.float() - args.penalties[:, None] * args.seen
             if args.temperatures is None:  # greedy sampling
                 return torch.argmax(logits, dim=-1)
             return sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)
