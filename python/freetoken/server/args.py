@@ -39,6 +39,10 @@ class ServerArgs(SchedulerConfig):
     # no sampling fields at all (the claude CLI sends only model/max_tokens/stream/messages)
     # has no way to pick. This is where a deployment states which one it is serving.
     sampling_override: dict = field(default_factory=dict)
+    # Chat-template kwargs applied to every request that does not state its own
+    # (--template-kwarg). Reaches controls no protocol exposes: a thinking on/off switch, or
+    # a model's reasoning-effort ladder (Qwen3.8: low/medium/xhigh, defaulting to xhigh).
+    template_kwarg: dict = field(default_factory=dict)
     # Default max output (decode) tokens for a request that omits one. None falls back to the
     # adapter's built-in default (32k).
     max_output_tokens: int | None = None
@@ -464,6 +468,21 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--template-kwarg",
+        action="append",
+        metavar="KEY=VALUE",
+        default=None,
+        help=(
+            "Chat-template kwarg for every request that does not state its own (repeatable). "
+            "'true'/'false' become booleans, anything else stays a string. Reaches controls "
+            "no wire protocol carries: --template-kwarg enable_thinking=false turns thinking "
+            "off, --template-kwarg reasoning_effort=low picks a shorter rung of a model's "
+            "effort ladder. Which keys do anything is the checkpoint's template's business; "
+            "an unknown one is silently ignored by Jinja."
+        ),
+    )
+
+    parser.add_argument(
         "--served-model-name",
         type=str,
         default=ServerArgs.served_model_name,
@@ -749,6 +768,17 @@ def parse_args(
                 f"{_SAMPLING_TYPES[key].__name__}, got {value.strip()!r}"
             ) from None
     kwargs["sampling_override"] = overrides
+
+    raw_tkw = kwargs.pop("template_kwarg", None) or []
+    tkw: dict = {}
+    for item in raw_tkw:
+        key, sep, value = str(item).partition("=")
+        key = key.strip()
+        if not sep or not key:
+            raise ValueError(f"--template-kwarg expects KEY=VALUE, got {item!r}")
+        v = value.strip()
+        tkw[key] = True if v.lower() == "true" else False if v.lower() == "false" else v
+    kwargs["template_kwarg"] = tkw
 
     if kwargs["served_model_name"] is None:
         kwargs["served_model_name"] = (

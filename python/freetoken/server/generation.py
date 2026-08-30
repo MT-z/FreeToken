@@ -140,6 +140,15 @@ class GenSpec:
     template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
     parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
 
+    def __post_init__(self) -> None:
+        # Server-wide template defaults (--template-kwarg) sit UNDER whatever the request
+        # produced, so a client that states a thinking mode still gets it. Merged here rather
+        # than in each adapter because every protocol funnels through this type, and because
+        # the downstream reasoning-parser gate reads chat_template_kwargs directly -- a later
+        # merge would leave that gate looking at the unmerged dict.
+        if TEMPLATE_DEFAULTS:
+            self.chat_template_kwargs = {**TEMPLATE_DEFAULTS, **(self.chat_template_kwargs or {})}
+
     @property
     def parse_tools(self) -> bool:
         return self.parser_tools is not None
@@ -277,6 +286,19 @@ def split_tool_lists(
     else:
         template = all_tool_dicts
     return template, all_tool_dicts
+
+
+#: Chat-template kwargs the deployment supplies for every request that does not state its
+#: own (``--template-kwarg``). A model card's controls often have no field in any protocol
+#: this server speaks -- Qwen3.8's ``reasoning_effort`` ladder is only a template variable,
+#: and the claude CLI sends ``thinking: {"type": "adaptive"}``, which names no state -- so
+#: without this the template's default (``xhigh``, its longest) is the only reachable one.
+TEMPLATE_DEFAULTS: dict[str, Any] = {}
+
+
+def set_template_defaults(defaults: dict[str, Any]) -> None:
+    global TEMPLATE_DEFAULTS
+    TEMPLATE_DEFAULTS = dict(defaults or {})
 
 
 # --------------------------------------------------------------------------- #

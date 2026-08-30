@@ -954,6 +954,11 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     # coding) can only be selected here when the client sends no sampling fields of its own.
     if config.sampling_override:
         _MODEL_SAMPLING = {**_MODEL_SAMPLING, **config.sampling_override}
+    if config.template_kwarg:
+        from freetoken.server.generation import set_template_defaults
+
+        set_template_defaults(config.template_kwarg)
+        logger.info(f"Chat-template defaults: {config.template_kwarg}")
     # Always surface the effective default sampling (model-recommended where available,
     # else framework defaults), since unspecified request fields resolve to these.
     logger.info(
