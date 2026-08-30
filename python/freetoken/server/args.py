@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import os
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -152,10 +153,16 @@ def parse_args(
             return "gemma4"
         if "qwen4_exp" in marker or "qwen4exp" in marker or "qwen3.8-flash" in marker:
             return "qwen3_coder"
-        if (
-            "qwen3_5" in marker
-            or "qwen3.5" in marker
-            or ("qwen3" in marker and "coder" in marker)
+        # The qwen3_5 family (3.5, 3.6, 3.8, ...) shares one XML tool dialect and spells its
+        # own name three ways: the HF ``model_type`` is ``qwen3_5``, a GGUF's is the
+        # separator-less ``qwen35``, and only the file name carries the marketing minor
+        # (``Qwen3.8-27B-UD-Q4_K_M.gguf``). Matching the family means accepting any of them
+        # -- a GGUF that fell through to ``qwen25`` emitted correct <function=...> XML that
+        # the JSON parser then rejected, which reads as a broken model rather than a
+        # mis-selected parser. Bare ``qwen3`` stays on qwen25: that is the older Qwen3, whose
+        # tool format really is the hermes-style JSON.
+        if re.search(r"qwen3[._]?(?:[5-9]|\d{2,})", marker) or (
+            "qwen3" in marker and "coder" in marker
         ):
             return "qwen3_coder"
         if "qwen" in marker:
