@@ -616,7 +616,8 @@ class Scheduler(SchedulerIOMixin):
         # snapshots (pair of the donate barrier in CacheManager._cache_req_hybrid; see the
         # comment there). Fires only when this batch admits a prefix HIT -- request-level,
         # sub-millisecond.
-        torch.cuda.synchronize(self.device)
+        if self.device.type == "cuda":  # CPU-only scheduler tests drive this path too
+            torch.cuda.synchronize(self.device)
         for req in batch.reqs:
             if req.mamba_restore_src is not None:
                 pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)

@@ -366,7 +366,10 @@ class CacheManager:
         # corrupted GDN state (reproduced with deterministic ground-truth probes: ~10% wrong
         # answers under saturation, cold prefill always clean). Fires once per prefill
         # commit / request finish -- request-level, sub-millisecond.
-        torch.cuda.synchronize(self.device)
+        # Guarded: the cache manager is exercised on CPU by the scheduler tests, where an
+        # unconditional cuda.synchronize raises 'Expected a cuda device, but got: cpu'.
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
         pool = self.linear_state_pool
         old_handle = req.cache_handle
         page_indices = self.page_table[req.table_idx, : req.cached_len]
