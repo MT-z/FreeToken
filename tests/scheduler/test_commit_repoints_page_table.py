@@ -140,3 +140,29 @@ def test_radix_subspan_commit_repoints_only_the_deduped_slice():
     canonical = d.cache_handle.get_matched_indices()
     assert page_table[2, : d.cache_handle.cached_len].tolist() == canonical[: d.cache_handle.cached_len].tolist()
     cm.check_integrity()
+
+
+def test_a_cpu_page_table_is_not_written_through_pinned_memory(monkeypatch):
+    """Page-locked host memory is allocated through CUDA. Keying the decision on
+    torch.cuda.is_available() pinned for a CPU page_table too -- which every scheduler unit
+    test builds on this box -- so an unrelated CPU test could fail with "CUDA error: out of
+    memory" whenever something else was using the GPU. Pin only for a real H2D copy."""
+    import torch
+
+    from freetoken.scheduler import cache as cache_mod
+
+    seen: list[bool] = []
+    real_empty = torch.empty
+
+    def spy(*args, **kw):
+        if "pin_memory" in kw:
+            seen.append(bool(kw["pin_memory"]))
+        return real_empty(*args, **kw)
+
+    monkeypatch.setattr(cache_mod.torch, "empty", spy)
+    page_table = torch.zeros(2, 8, dtype=torch.int32)
+    cache_mod._write_page_table(
+        page_table, torch.arange(4, dtype=torch.int32), [(0, 0, 4)], page_size=1
+    )
+    assert seen and not any(seen), f"pinned for a CPU destination: {seen}"
+    assert page_table[0, :4].tolist() == [0, 1, 2, 3]

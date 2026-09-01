@@ -172,6 +172,7 @@ def resolve_sampling(
     ignore_eos: bool,
     model_sampling: dict[str, Any],
     stop: str | list[str] | None = None,
+    presence_penalty: float | None = None,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
     filling unspecified fields from the checkpoint's recommended defaults."""
@@ -192,10 +193,11 @@ def resolve_sampling(
         temperature=pick(temperature, "temperature", 0.0),
         top_k=pick(top_k, "top_k", -1),
         top_p=pick(top_p, "top_p", 1.0),
-        # No protocol this server speaks carries a presence penalty, so it comes only from the
-        # deployment's defaults (--sampling-override presence_penalty=...). Model cards pair it
-        # with the temperature they recommend; generation_config.json cannot express it.
-        presence_penalty=model_sampling.get("presence_penalty", 0.0),
+        # OpenAI's protocol carries this one; Anthropic's does not. Either way an unspecified
+        # request falls through to the deployment's default (--sampling-override
+        # presence_penalty=...), which is how a model card's anti-repetition recommendation gets
+        # served at all -- generation_config.json cannot express it.
+        presence_penalty=pick(presence_penalty, "presence_penalty", 0.0),
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
     )
 

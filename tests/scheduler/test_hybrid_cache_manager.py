@@ -49,16 +49,22 @@ def test_hybrid_cache_manager_donate_then_hit():
     reqA.mamba_last_track_seqlen = 4
     cm.lock(mr.cuda_handle)
 
+    clone_before = set(pool._free_slots)
     free_before = pool.num_free_slots
-    cm.cache_req(reqA, finished=False)       # donate pp[0] at boundary 4; replace it in the pair
-    # pp[0] donated to the tree; a fresh replacement was alloc'd -> net free-slot count unchanged
-    assert pool.num_free_slots == free_before - 1  # one replacement alloc'd (donated slot now tree-owned)
-    assert reqA.mamba_ping_pong[0] != pp[0]        # slot 0 replaced; pp[0] now lives in the tree
+    cm.cache_req(reqA, finished=False)       # copy-on-donate: the request keeps pp[0]; the tree
+    # gets a PRIVATE CLONE of it, allocated from the free list. The request's slot is NOT
+    # replaced (no shared slot id), so the only free-list delta is the clone itself.
+    assert pool.num_free_slots == free_before - 1  # one clone alloc'd (node was new: not freed back)
+    clone_ids = clone_before - set(pool._free_slots)
+    assert len(clone_ids) == 1
+    clone_id = next(iter(clone_ids))
+    assert reqA.mamba_ping_pong[0] == pp[0]        # request keeps its own slot (no replacement alloc)
 
-    # req B shares the [1,2,3,4] prefix -> HIT: returns the donated snapshot + reused KV
+    # req B shares the [1,2,3,4] prefix -> HIT: the tree's snapshot is the private CLONE,
+    # not the request's own slot.
     mrB = cm.match_req(_pend([1, 2, 3, 4, 9]))
     assert mrB.cuda_handle.cached_len == 4
-    assert mrB.mamba_value == pp[0]
+    assert mrB.mamba_value == clone_id
     assert mrB.cuda_handle.get_matched_indices().tolist() == [100, 101, 102, 103]
 
 
@@ -76,10 +82,15 @@ def test_hybrid_finish_donates_live_slot():
     req.linear_slot_idx, req.mamba_ping_pong = live, pp
     cm.lock(mr.cuda_handle)
 
-    cm.cache_req(req, finished=True)         # donate the live slot directly (final state)
-    # ping-pong pair freed; live slot kept (now owned by the tree)
+    clone_before = set(pool._free_slots)
+    cm.cache_req(req, finished=True)         # copy-on-donate: the tree gets a PRIVATE CLONE of
+    # the live (final-state) slot; the request's live + ping-pong slots are freed.
+    clone_after = set(pool._free_slots)
+    clone_ids = clone_before - clone_after
+    assert len(clone_ids) == 1                       # exactly one CLONE allocated for the node
+    clone_id = next(iter(clone_ids))
     mr2 = cm.match_req(_pend([7, 8, 9, 10]))
-    assert mr2.cuda_handle.cached_len == 3 and mr2.mamba_value == live
+    assert mr2.cuda_handle.cached_len == 3 and mr2.mamba_value == clone_id
 
 
 def test_free_req_slots_idempotent():

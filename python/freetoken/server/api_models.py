@@ -74,7 +74,10 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     stream_options: StreamOptions | None = None
     stop: str | list[str] | None = None
-    presence_penalty: float = 0.0
+    # None, not 0.0: the deployment can set a presence penalty the checkpoint's model card
+    # recommends (--sampling-override presence_penalty=1.5), and a request that simply omits
+    # the field must not silently override it with the protocol's default.
+    presence_penalty: float | None = None
     frequency_penalty: float = 0.0
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
     reasoning_effort: str | None = None
@@ -112,7 +115,10 @@ class CompletionRequest(BaseModel):
     stream: bool = False
     stream_options: StreamOptions | None = None
     stop: str | list[str] | None = None
-    presence_penalty: float = 0.0
+    # None, not 0.0: the deployment can set a presence penalty the checkpoint's model card
+    # recommends (--sampling-override presence_penalty=1.5), and a request that simply omits
+    # the field must not silently override it with the protocol's default.
+    presence_penalty: float | None = None
     frequency_penalty: float = 0.0
     ignore_eos: bool = False
     logprobs: int | None = None

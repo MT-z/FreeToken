@@ -683,9 +683,12 @@ def _write_page_table(
     page_size: int,
 ) -> None:
     needed_tokens = len(allocated)
-    # Pinned only when there is a device to copy to asynchronously; CPU-only runs (unit tests,
-    # a CPU CI runner) would otherwise raise instead of just doing a plain host allocation.
-    pin = torch.cuda.is_available()
+    # Pin only when the copy below is actually host->device. Keying this on
+    # torch.cuda.is_available() instead pins for a CPU page_table too (the scheduler unit tests
+    # build one on a CUDA box): page-locked host memory is allocated through CUDA, so it buys
+    # nothing there and fails outright when the GPU is under pressure -- turning an unrelated
+    # CPU test into "CUDA error: out of memory".
+    pin = page_table.device.type == "cuda"
     table_idx_host = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=pin)
     positions_host = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=pin)
     offset = 0
