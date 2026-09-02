@@ -461,8 +461,10 @@ def parse_args(
         help=(
             "Override a default sampling param on top of --sampling-defaults, as KEY=VALUE "
             "(repeatable). Keys: temperature, top_p, top_k, presence_penalty. Only fills "
-            "request fields the client left unspecified; presence_penalty has no request "
-            "field at all, so this is the only way to set it. Example: "
+            "request fields the client left unspecified. presence_penalty is the one key "
+            "generation_config.json cannot carry, so under any protocol this is the only way "
+            "to set it as a deployment default; an OpenAI request can then override that "
+            "default, an Anthropic one cannot -- that wire format has no such field. Example: "
             "--sampling-override temperature=1.0 --sampling-override presence_penalty=1.5"
         ),
     )

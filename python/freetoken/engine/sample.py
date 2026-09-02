@@ -63,10 +63,16 @@ class Sampler:
     def _presence(self, batch: Batch) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """``(penalties [bs], seen [bs, vocab])`` for the presence penalty, or ``(None, None)``.
 
-        ``seen`` is rebuilt each step rather than carried between them: at decode batch sizes
-        it is a few MB of scatter (~0.2% of a step) against having to track slot reuse,
-        aborts and finishes for a persistent per-request bitmap. Only tokens the request
-        itself generated count -- ``input_ids[:prompt_len]`` is the prompt.
+        ``seen`` is rebuilt each step rather than carried between them. It is not small at
+        width -- 4.6 MiB at bs=8 but 74 MiB at bs=128 on a 152k vocab -- yet the rebuild is
+        not what costs: zeros+scatter+H2D does not grow from bs=64 to bs=128 (0.41 -> 0.34
+        ms), the caching allocator serving the repeated ``zeros`` out of a block it already
+        holds. The dominant term is the apply in ``sample`` below, which upcasts the whole
+        bf16 logits tensor to float32 and reads ``seen``: 0.58 ms of the 0.92 ms total at
+        bs=128. So a persistent per-request bitmap would buy only the cheaper half and still
+        owe slot-reuse, abort and finish bookkeeping; the lever is fusing the penalty into
+        the sampling kernel, which drops the materialization and the float32 copy both. Only
+        tokens the request itself generated count -- ``input_ids[:prompt_len]`` is the prompt.
         """
         pens = [r.sampling_params.presence_penalty for r in batch.reqs]
         if not any(pens):
