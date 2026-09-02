@@ -62,6 +62,21 @@ class PrefillAdder:
         if self.max_chunk_budget == 0:
             self.max_chunk_budget = self.token_budget
 
+    def _max_span_budget(self) -> int:
+        """Widest UNSPLITTABLE run a prefill chunk could ever carry, on an idle server. The
+        terminal-vs-transient test for an image span: below this a decline must be transient
+        (the request retries when it reaches the head), at or above it no wait can help and the
+        request has to be told so. max_chunk_budget alone overstates it on a paged-swa model,
+        whose chunk is also capped by the window pool -- and a pool too small for the span
+        never grows into one, so that case must reject rather than retry forever."""
+        budget = self.max_chunk_budget
+        pool = self.cache_manager.swa_pool if self.cache_manager.swa_paged else None
+        if pool is not None:
+            # Total capacity, not swa_available_size: the free space is what THIS pass has, and
+            # rejecting on it would kill a servable prompt whenever decodes hold the pool.
+            budget = min(budget, max(getattr(pool, "swa_num_tokens", budget) - 1, 0))
+        return budget
+
     def _release_admission(self, handle, table_idx, linear_slot_idx, ping_pong) -> None:
         """Undo _try_allocate_one. Nothing has been forwarded, so this is the cheap release:
         drop the prefix-cache lock, hand back the table row, return the GDN slots. Without it
@@ -216,7 +231,16 @@ class PrefillAdder:
             else:
                 lo, hi = span
             end = cached_len + chunk_size
-            if lo < end < hi and lo > cached_len and hi - lo <= chunk_size:
+            # What a chunk carrying the span actually costs. A chunk may only START on a
+            # `unit`-aligned boundary, so the one holding the span also carries the
+            # [align_down(lo, unit), lo) head -- charge it here, or every fit test below reads
+            # `unit - 1` tokens wider than the truth.
+            unit = max(self.cache_manager.prefill_chunk_align, 1)
+            if self.cache_manager.swa_paged:
+                unit = max(unit, self.cache_manager.page_size)
+            span_start = align_down(lo, unit)
+            span_need = hi - span_start
+            if lo < end < hi and lo > cached_len and span_need <= chunk_size:
                 # End just before the span instead, so it rides the NEXT chunk whole. Gated on
                 # the span FITTING a chunk this size: pulling back for a span that can never
                 # fit would spend a chunk of prefill and then reject on the following pass,
@@ -224,10 +248,7 @@ class PrefillAdder:
                 # Keep both alignments the sizing above established (page-aligned swa
                 # boundary, snapshot boundary); 0 after that means no whole unit fits -> fall
                 # through to the rejection, which is also what a retry would decide.
-                unit = max(self.cache_manager.prefill_chunk_align, 1)
-                if self.cache_manager.swa_paged:
-                    unit = max(unit, self.cache_manager.page_size)
-                pulled = align_down(lo, unit) - cached_len
+                pulled = span_start - cached_len
                 if pulled > 0:
                     chunk_size = pulled
                     end = cached_len + chunk_size
@@ -237,18 +258,31 @@ class PrefillAdder:
                 # the budget race would be killed for being second in line. Compare against the
                 # pass's full budget instead and, below that, decline transiently (return None)
                 # so the request retries once it reaches the front of the queue.
-                if hi - lo <= self.max_chunk_budget:
+                #
+                # "Ever" means the ceiling a pass could reach with an empty server, so both
+                # terms that bound a chunk belong here: the prefill budget AND, on a paged-swa
+                # model, the whole window pool (swa_available_size is the CURRENT free space --
+                # using it would reject under transient load). Missing either turns a terminal
+                # reject into a silent forever-retry: try_add_one returning None breaks the
+                # admission loop, so the queue behind this request stalls with it.
+                if span_need <= self._max_span_budget():
                     return None
+                head = lo - span_start
+                aligned_note = (
+                    f", and a chunk can only start on a {unit}-token boundary so it also "
+                    f"carries the {head} tokens before the span"
+                ) if head else ""
                 self.rejected.append(
                     (
                         pending_req.uid,
                         (
-                            f"prompt with images needs {hi - lo} contiguous tokens in one "
+                            f"prompt with images needs {span_need} contiguous tokens in one "
                             f"prefill chunk (the image tokens span [{lo}, {hi}) and cannot "
-                            f"be split) but the largest chunk this server will schedule is "
-                            f"{self.max_chunk_budget}; raise --max-prefill-length, and for a "
-                            f"sliding-window model the window pool caps it further "
-                            f"(--swa-num-pages-override / --kv-reserve-tokens)"
+                            f"be split{aligned_note}) but the largest chunk this server will "
+                            f"schedule is {self._max_span_budget()}; raise "
+                            f"--max-prefill-length, and for a sliding-window model the window "
+                            f"pool caps it further (--swa-num-pages-override / "
+                            f"--kv-reserve-tokens)"
                         ),
                         chunked_req,
                     )
