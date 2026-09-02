@@ -101,8 +101,45 @@ class StatsTracker:
         return self._rate(self._prefill, now)
 
 
-def derive_model_card(config: Any) -> dict:
-    """attn enum + moe bool + ctx from the model config."""
+def effective_context_length(config: Any, cache_pools: Any = None, last_rebuild: Any = None) -> int | None:
+    """The context length the server will actually accept, for /v1/models and /v1/stats.
+
+    The model's rope ceiling (``config.max_seq_len``, already honouring --max-seq-len-override)
+    is only the upper bound: the scheduler rejects any prompt longer than
+    ``engine.max_seq_len = min(ceiling, KV pool tokens)`` with context_length_exceeded. Clients
+    plan against the advertised number -- Claude Code sizes its compaction from it -- so
+    advertising the ceiling while holding a smaller pool made a 25k-token first turn fail against
+    an 8k pool, and 186k against a 131k one. Preference order:
+
+      1. the last successful rebuild's ``max_seq_len`` (the pool was just resized);
+      2. the load-time ``pools["max_seq_len"]`` from the meta ack;
+      3. for an older engine that reports pool sizes but not the limit, ``num_pages * page_size``;
+      4. the ceiling alone.
+
+    Always ``min(ceiling, effective)``; a client that read the value once at startup and sees the
+    pool grow later merely under-uses the new room, which is the safe direction. None when the
+    ceiling itself is unknown (never raise from a metadata route).
+    """
+    try:
+        ceiling = int(config.max_seq_len)
+    except Exception:  # noqa: BLE001
+        return None
+    if ceiling <= 0:
+        return None
+    effective = 0
+    last = last_rebuild if isinstance(last_rebuild, dict) else {}
+    pools = cache_pools if isinstance(cache_pools, dict) else {}
+    if last.get("status") == "ok":
+        effective = int(last.get("max_seq_len") or 0)
+    if effective <= 0:
+        effective = int(pools.get("max_seq_len") or 0)
+    if effective <= 0:
+        effective = int(pools.get("num_pages") or 0) * int(pools.get("page_size") or 0)
+    return min(ceiling, effective) if effective > 0 else ceiling
+
+
+def derive_model_card(config: Any, cache_pools: Any = None, last_rebuild: Any = None) -> dict:
+    """attn enum + moe bool + ctx: the effective context length (see effective_context_length)."""
     mc = config.model_config
     if getattr(mc, "has_linear_attention", False):
         attn = "hybrid_linear"
@@ -112,7 +149,7 @@ def derive_model_card(config: Any) -> dict:
         attn = "mha"
     return {
         "id": config.served_model_name,
-        "ctx": config.max_seq_len,
+        "ctx": effective_context_length(config, cache_pools, last_rebuild),
         "attn": attn,
         "moe": bool(getattr(mc, "is_moe", False)),
     }
@@ -154,7 +191,9 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
     )
     return {
         "instance_id": getattr(state, "instance_id", None),
-        "model": derive_model_card(config),
+        "model": derive_model_card(
+            config, getattr(state, "cache_pools", None), getattr(state, "last_rebuild", None)
+        ),
         "uptime_s": uptime_s,
         "kv": kv,
         "mamba": mamba,

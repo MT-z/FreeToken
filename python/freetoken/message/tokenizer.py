@@ -99,6 +99,7 @@ class CacheRebuildResultMsg(BaseTokenizerMsg):
     num_pages: int = 0
     mamba_slots: int = 0
     num_swa_pages: int = 0
+    max_seq_len: int = 0  # engine.max_seq_len after the rebuild; 0 from an older scheduler
     error: str | None = None
 
 

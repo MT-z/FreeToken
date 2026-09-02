@@ -92,3 +92,14 @@ def test_log_cache_geometry_plain_model_kv_only(monkeypatch):
     line = lines[-1]
     assert "Cache rebuilt: KV 64 pages (1024 tokens, 1.00 GiB)" in line
     assert "swa" not in line and "mamba" not in line and "MoE" not in line
+
+
+def test_cache_pools_carry_the_engines_effective_max_seq_len():
+    """The meta ack seeds /v1/models with the limit the scheduler enforces; 0 when the engine
+    predates the field so the frontend falls back to num_pages * page_size."""
+    from freetoken.kvcache.cache_status import compute_cache_pools
+
+    eng = _fake_engine()
+    assert compute_cache_pools(eng)["max_seq_len"] == 0
+    eng.max_seq_len = 1000
+    assert compute_cache_pools(eng)["max_seq_len"] == 1000

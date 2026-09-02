@@ -286,6 +286,7 @@ class FrontendManager:
             "num_pages": msg.num_pages,
             "mamba_slots": msg.mamba_slots,
             "num_swa_pages": msg.num_swa_pages,
+            "max_seq_len": getattr(msg, "max_seq_len", 0) or 0,
             "error": msg.error,
         }
         fut = self.rebuild_futures.pop(msg.request_id, None)

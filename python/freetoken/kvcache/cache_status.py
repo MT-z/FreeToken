@@ -153,11 +153,15 @@ def compute_cache_pools(engine: "Engine") -> Dict[str, int]:
     scheduler's reported totals. 0 for pools the model lacks; never raises."""
     pools = {
         "num_pages": 0, "page_size": 0, "moe_cache_size": 0, "num_mamba_slots": 0,
-        "swa_page_size": 0, "num_swa_pages": 0,
+        "swa_page_size": 0, "num_swa_pages": 0, "max_seq_len": 0,
     }
     try:
         config = engine.config
         pools["num_pages"] = int(engine.num_pages or 0)
+        # The limit the scheduler actually enforces: min(model ceiling, KV pool tokens), set in
+        # Engine right after the pool is sized. Advertised by /v1/models so a client never
+        # plans a prompt the server will reject with context_length_exceeded.
+        pools["max_seq_len"] = int(getattr(engine, "max_seq_len", 0) or 0)
         if config is not None:
             pools["page_size"] = int(config.page_size or 0)
             # Window pool: its own page unit (swa_page_size -- DSV4 windows are P-token pages,

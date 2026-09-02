@@ -651,6 +651,7 @@ class Scheduler(SchedulerIOMixin):
                     num_pages=geo["num_pages"],
                     mamba_slots=geo["num_mamba_slots"] or 0,
                     num_swa_pages=geo["num_swa_pages"] or 0,
+                    max_seq_len=geo.get("max_seq_len") or 0,
                     error=error,
                 )
             ]
@@ -751,6 +752,7 @@ class Scheduler(SchedulerIOMixin):
             moe_cache_size=eng.moe_offload_cache.cache_size if eng.moe_offload_cache is not None else None,
             num_mamba_slots=(eng.linear_state_pool.num_slots - 1) if eng.linear_state_pool is not None else None,
             num_swa_pages=num_swa_pages,
+            max_seq_len=int(getattr(eng, "max_seq_len", 0) or 0),
         )
 
     def _log_cache_geometry(self, event: str) -> None:

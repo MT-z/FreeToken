@@ -679,10 +679,20 @@ def _served_model_name(state: Any) -> str:
 
 
 def _model_context_length(state: Any) -> int | None:
-    """The model ceiling, not `min(ceiling, KV budget)`: a rebuild moves the latter, and agents
-    read this once at startup."""
-    try:  # never 500 a metadata route: max_seq_len walks into the HF config on some builds
-        value = int(state.config.max_seq_len)
+    """min(model ceiling, KV pool tokens) -- the limit the scheduler enforces, not the ceiling.
+
+    Until 2026-09 this returned the ceiling on purpose ("a rebuild moves the KV budget, and
+    agents read this once at startup"). In practice the agent then plans a prompt the server
+    cannot hold: Claude Code, sized from this field, sent 25k tokens to an 8k pool and 186k to a
+    131k one and got context_length_exceeded both times. Advertising the smaller number is the
+    safe error -- an agent that cached it before a rebuild grew the pool just leaves room unused.
+    Never raises: max_seq_len walks into the HF config on some builds; None means unknown.
+    """
+    from .stats import effective_context_length
+
+    try:
+        return effective_context_length(
+            state.config, getattr(state, "cache_pools", None), getattr(state, "last_rebuild", None)
+        )
     except Exception:  # noqa: BLE001
         return None
-    return value if value > 0 else None

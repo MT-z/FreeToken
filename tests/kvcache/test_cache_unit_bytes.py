@@ -267,7 +267,7 @@ def test_compute_cache_pools_reads_load_time_allocations():
         "moe_cache_size": 526,
         "num_mamba_slots": 64,
         "swa_page_size": 0,
-        "num_swa_pages": 0,
+        "num_swa_pages": 0, "max_seq_len": 0,
     }
 
 
@@ -281,7 +281,7 @@ def test_compute_cache_pools_zero_for_missing_pools():
         "moe_cache_size": 0,
         "num_mamba_slots": 0,
         "swa_page_size": 0,
-        "num_swa_pages": 0,
+        "num_swa_pages": 0, "max_seq_len": 0,
     }
 
 

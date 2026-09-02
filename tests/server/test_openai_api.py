@@ -676,3 +676,54 @@ def test_minimax_http_non_stream_forces_implicit_reasoning_without_request_knob(
     message = response["choices"][0]["message"]
     assert message["reasoning_content"] == "private thought"
     assert message["content"] == "visible answer"
+
+
+def test_models_route_advertises_the_kv_limit_not_the_rope_ceiling():
+    """Claude Code sizes its context window from this field. The rope ceiling is only an upper
+    bound; the scheduler rejects anything past min(ceiling, KV pool), so that is what we say."""
+    state = FakeState([])
+    state.config.max_seq_len = 262144
+    state.cache_pools = {"num_pages": 129, "page_size": 64, "max_seq_len": 8256}
+    app = FastAPI()
+    register_openai_routes(app, lambda: state, lambda: {})
+
+    card = TestClient(app).get("/v1/models").json()["data"][0]
+
+    assert card["max_model_len"] == 8256
+    assert card["context_length"] == 8256
+
+
+def test_models_route_follows_a_successful_rebuild_but_not_a_failed_one():
+    state = FakeState([])
+    state.config.max_seq_len = 262144
+    state.cache_pools = {"max_seq_len": 8256}
+    app = FastAPI()
+    register_openai_routes(app, lambda: state, lambda: {})
+    client = TestClient(app)
+
+    state.last_rebuild = {"status": "ok", "max_seq_len": 131072}
+    assert client.get("/v1/models").json()["data"][0]["max_model_len"] == 131072
+
+    # A failed rebuild leaves the old pool in place, so its numbers must not be believed.
+    state.last_rebuild = {"status": "failed", "max_seq_len": 4096}
+    assert client.get("/v1/models").json()["data"][0]["max_model_len"] == 8256
+
+
+def test_models_route_derives_the_limit_for_an_engine_that_reports_only_pool_sizes():
+    state = FakeState([])
+    state.config.max_seq_len = 262144
+    state.cache_pools = {"num_pages": 2049, "page_size": 64}  # older meta ack: no max_seq_len
+    app = FastAPI()
+    register_openai_routes(app, lambda: state, lambda: {})
+
+    assert TestClient(app).get("/v1/models").json()["data"][0]["max_model_len"] == 2049 * 64
+
+
+def test_models_route_never_advertises_past_the_rope_ceiling():
+    state = FakeState([])
+    state.config.max_seq_len = 4096
+    state.cache_pools = {"max_seq_len": 8256}
+    app = FastAPI()
+    register_openai_routes(app, lambda: state, lambda: {})
+
+    assert TestClient(app).get("/v1/models").json()["data"][0]["max_model_len"] == 4096

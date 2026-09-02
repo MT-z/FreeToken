@@ -228,6 +228,7 @@ def tokenize_worker(
                             num_pages=m.num_pages,
                             mamba_slots=m.mamba_slots,
                             num_swa_pages=m.num_swa_pages,
+                            max_seq_len=getattr(m, "max_seq_len", 0) or 0,
                             error=m.error,
                         )
                     )
