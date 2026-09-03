@@ -141,6 +141,59 @@ class HostBank:
             ) from exc
         self._pinned = True
 
+    def pin_prefix(self, nrows: int) -> None:
+        """Pin only the first ``nrows`` rows (disk tier: the rest stays disk-resident).
+
+        The unpinned tail keeps its filled pages until :meth:`release_range` drops
+        them; nothing may DMA from the tail (the disk tier's miss filter guarantees
+        the GPU never copies those rows)."""
+        if self._pinned:
+            return
+        from freetoken.kernel.pinned import host_register
+
+        row_bytes = self.nbytes // self.tensor.shape[0]
+        nbytes = nrows * row_bytes
+        try:
+            host_register(self.addr, nbytes)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"cudaHostRegister failed for {nbytes / 2**30:.1f} GiB prefix"
+            ) from exc
+        self._pinned = True
+
+    def release_range(self, offset: int, nbytes: int) -> None:
+        """Free a byte range of the backing mapping by replacing it IN PLACE with a
+        fresh MAP_PRIVATE anonymous mapping at the same virtual address.
+
+        HostBank's buffer is a MAP_SHARED /dev/zero mapping (CPython's
+        ``mmap(-1)``), and the kernel silently ignores MADV_DONTNEED on shared
+        mappings -- the pages would stay resident. Replacing the range with a
+        private zero mapping frees them while keeping every existing pointer
+        and torch view valid (same address). The range must be page-aligned
+        and must not overlap a pinned prefix (the disk tier's unpinned tails).
+        """
+        import ctypes
+
+        _BLK = 4096
+        assert offset % _BLK == 0 and nbytes % _BLK == 0, (
+            "release_range: page-aligned range required")
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        libc.munmap.restype = ctypes.c_int
+        libc.mmap.restype = ctypes.c_void_p
+        libc.mmap.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
+        addr = self.addr + offset
+        if libc.munmap(addr, nbytes) != 0:
+            raise OSError(ctypes.get_errno(), "munmap failed")
+        PROT_READ_WRITE = 3
+        MAP_PRIVATE_ANON = 0x22  # MAP_PRIVATE | MAP_ANONYMOUS
+        MAP_FIXED = 0x10
+        MAP_FAILED = (1 << 64) - 1
+        new_addr = libc.mmap(addr, nbytes, PROT_READ_WRITE, MAP_PRIVATE_ANON | MAP_FIXED, -1, 0)
+        if new_addr in (None, MAP_FAILED):
+            raise OSError(ctypes.get_errno(), "mmap(MAP_FIXED) failed")
+        assert new_addr == addr, "MAP_FIXED returned a different address"
     def release(self) -> None:
         """Drop the resident pages; the address space stays valid, the contents become undefined.
 
@@ -289,7 +342,8 @@ class PinPipeline:
     A clean context-manager exit drains the queue and re-raises the first settle failure.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, prefix_rows: int | None = None) -> None:
+        self._prefix_rows = prefix_rows
         self._q: queue.SimpleQueue = queue.SimpleQueue()
         self._exc: BaseException | None = None
         # the current device is thread-local: a fresh thread sits on device 0 and cudaHostRegister would build its context there -- carry the creator's (bound) device into the worker
@@ -308,9 +362,16 @@ class PinPipeline:
                 continue  # drain without settling after a failure
             bank, residency, plan, layer_id = item
             try:
-                _settle(bank, residency)
-                if plan is not None and residency == HostResidency.LOCKED.value:
-                    plan.record(layer_id, bank.residency.value)
+                if self._prefix_rows is not None:
+                    # Disk tier: pin only the RAM-resident expert prefix; the
+                    # disk-resident tail is released by the caller. Takes
+                    # precedence over the residency label (H2D needs the
+                    # prefix page-locked regardless).
+                    bank.pin_prefix(self._prefix_rows)
+                else:
+                    _settle(bank, residency)
+                    if plan is not None and residency == HostResidency.LOCKED.value:
+                        plan.record(layer_id, bank.residency.value)
             except BaseException as exc:  # surfaced by wait()/__exit__
                 self._exc = exc
 
