@@ -135,17 +135,25 @@ def test_an_explicit_choice_beats_inference():
     assert pinned.reasoning_parser == "qwen3"
 
 @pytest.mark.parametrize("path,expected", [
-    # A 2+ digit run after the separator is a parameter count, not a minor version. These
-    # regressed to qwen3_coder when the family matcher started accepting ``\d{2,}``.
+    # A digit run followed by ``b`` is a SIZE, not a minor version: parameter counts of every
+    # width, and MLX/exl2-style bit widths. Each of these selected the XML parser at some point.
+    ("/models/qwen3_8b", "qwen25"),
+    ("/models/Qwen3_8B-Instruct", "qwen25"),
+    ("/models/Qwen3_14B", "qwen25"),
     ("/models/qwen3_30b", "qwen25"),
     ("/models/Qwen3_235B-A3B", "qwen25"),
     ("/models/Qwen3.30B-Instruct", "qwen25"),
-    # ... while every spelling of the 3.5+ family still reaches the XML parser.
+    ("/models/qwen3_8bit", "qwen25"),
+    # ... while every spelling of the 3.5+ family reaches the XML parser, including a
+    # two-digit minor that has not shipped yet and the separator-less form. Neither of these
+    # rows can pass through the ``qwen3`` + ``coder`` disjunct, so they pin the pattern itself.
     ("/models/qwen3_5_moe", "qwen3_coder"),
-    ("/models/Qwen35-Coder", "qwen3_coder"),
+    ("/models/Qwen3.8-Flash", "qwen3_coder"),
+    ("/models/qwen35-a3b", "qwen3_coder"),
+    ("/models/Qwen3.10-27B-Instruct", "qwen3_coder"),
 ])
-def test_a_parameter_count_is_not_read_as_a_minor_version(path, expected):
-    """``Qwen3_235B-A3B`` is the OLDER generation with 235B parameters, not Qwen3.235.
+def test_a_size_is_not_read_as_a_minor_version(path, expected):
+    """``Qwen3_8B`` is the OLDER generation with 8B parameters, not Qwen3.8.
 
     Dense Qwen3 emits hermes-style JSON tool calls; handing it the qwen3_coder XML parser makes
     every tool call fail to parse, which reads as a broken model rather than a mis-selected

@@ -171,12 +171,14 @@ def parse_args(
         # the JSON parser then rejected, which reads as a broken model rather than a
         # mis-selected parser. Bare ``qwen3`` stays on qwen25: that is the older Qwen3, whose
         # tool format really is the hermes-style JSON.
-        # ``[5-9]`` and no digit after it: the minor version, however it is spelled
-        # (``qwen3_5``, ``qwen3.8``, separator-less ``qwen35``). A 2+ digit run is a PARAMETER
-        # COUNT -- ``qwen3_30b``, ``Qwen3_235B-A3B`` -- and matching it sent dense Qwen3
-        # checkpoints with an underscore in the path to the XML parser, which then rejected the
-        # JSON their tool calls really use.
-        if re.search(r"qwen3[._]?[5-9](?![0-9])", marker) or (
+        # The minor version, however it is spelled (``qwen3_5``, ``qwen3.8``, separator-less
+        # ``qwen35``), and two-digit minors that do not exist yet (``qwen3.10``). What must NOT
+        # match is a size: ``qwen3_8b``, ``Qwen3_14B``, ``qwen3_30b``, ``Qwen3_235B-A3B``,
+        # ``qwen3_8bit``. A digit run followed by ``b`` is a parameter count or a bit width, and
+        # matching one sent dense Qwen3 checkpoints -- whose tool calls really are hermes-style
+        # JSON -- to the XML parser. The ``b`` is the only signal that separates ``qwen3.8``
+        # (minor 8) from ``qwen3_8b`` (8 billion parameters), so it is what the lookahead reads.
+        if re.search(r"qwen3[._]?(?:[5-9]|\d{2})(?![0-9b])", marker) or (
             "qwen3" in marker and "coder" in marker
         ):
             return "qwen3_coder"

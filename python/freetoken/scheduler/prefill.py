@@ -77,19 +77,6 @@ class PrefillAdder:
             budget = min(budget, max(getattr(pool, "swa_num_tokens", budget) - 1, 0))
         return budget
 
-    def _span_chunk_cost(self, lo: int, hi: int, input_len: int, unit: int) -> int:
-        """Tokens ONE chunk must carry to hold the image span ``[lo, hi)`` whole.
-
-        A chunk may only start on a ``unit`` boundary, so it also carries the head
-        ``[align_down(lo, unit), lo)`` -- already accounted for elsewhere. Where it may END is
-        the other half: a non-final chunk ends on a ``unit`` boundary too, so it runs on to the
-        first one at or after ``hi``; only a chunk that reaches the prompt end may stop
-        unaligned (the sizing above keeps that fallback). A pass can schedule the cheaper of
-        the two, so that minimum is what the terminal-vs-transient test must compare.
-        """
-        start = align_down(lo, unit)
-        return min(div_ceil(hi, unit) * unit - start, input_len - start)
-
     def _release_admission(self, handle, table_idx, linear_slot_idx, ping_pong) -> None:
         """Undo _try_allocate_one. Nothing has been forwarded, so this is the cheap release:
         drop the prefix-cache lock, hand back the table row, return the GDN slots. Without it
@@ -278,23 +265,13 @@ class PrefillAdder:
                 # using it would reject under transient load). Missing either turns a terminal
                 # reject into a silent forever-retry: try_add_one returning None breaks the
                 # admission loop, so the queue behind this request stalls with it.
-                # Charge where the chunk may END as well: [span_start, hi) alone overstates
-                # what a pass can schedule, and a span in that gap declines transiently for
-                # ever -- exactly the stall the paragraph above exists to prevent.
-                span_cost = self._span_chunk_cost(lo, hi, pending_req.input_len, unit)
-                if span_cost <= self._max_span_budget():
+                if span_need <= self._max_span_budget():
                     return None
                 head = lo - span_start
-                notes = []
-                if head:
-                    notes.append(
-                        f"a chunk can only start on a {unit}-token boundary so it also carries "
-                        f"the {head} tokens before the span")
-                if span_cost > span_need:
-                    notes.append(
-                        f"it must then run on to the next {unit}-token boundary, "
-                        f"{span_cost - span_need} tokens past the span")
-                aligned_note = (", and " + "; ".join(notes)) if notes else ""
+                aligned_note = (
+                    f", and a chunk can only start on a {unit}-token boundary so it also "
+                    f"carries the {head} tokens before the span"
+                ) if head else ""
                 self.rejected.append(
                     (
                         pending_req.uid,
