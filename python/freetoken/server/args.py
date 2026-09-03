@@ -171,7 +171,12 @@ def parse_args(
         # the JSON parser then rejected, which reads as a broken model rather than a
         # mis-selected parser. Bare ``qwen3`` stays on qwen25: that is the older Qwen3, whose
         # tool format really is the hermes-style JSON.
-        if re.search(r"qwen3[._]?(?:[5-9]|\d{2,})", marker) or (
+        # ``[5-9]`` and no digit after it: the minor version, however it is spelled
+        # (``qwen3_5``, ``qwen3.8``, separator-less ``qwen35``). A 2+ digit run is a PARAMETER
+        # COUNT -- ``qwen3_30b``, ``Qwen3_235B-A3B`` -- and matching it sent dense Qwen3
+        # checkpoints with an underscore in the path to the XML parser, which then rejected the
+        # JSON their tool calls really use.
+        if re.search(r"qwen3[._]?[5-9](?![0-9])", marker) or (
             "qwen3" in marker and "coder" in marker
         ):
             return "qwen3_coder"

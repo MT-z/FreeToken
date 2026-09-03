@@ -133,3 +133,27 @@ def test_an_explicit_choice_beats_inference():
         pinned, _ = parse_args(["--model", ANON_PATH, "--reasoning-parser", "qwen3"])
     assert off.reasoning_parser is None
     assert pinned.reasoning_parser == "qwen3"
+
+@pytest.mark.parametrize("path,expected", [
+    # A 2+ digit run after the separator is a parameter count, not a minor version. These
+    # regressed to qwen3_coder when the family matcher started accepting ``\d{2,}``.
+    ("/models/qwen3_30b", "qwen25"),
+    ("/models/Qwen3_235B-A3B", "qwen25"),
+    ("/models/Qwen3.30B-Instruct", "qwen25"),
+    # ... while every spelling of the 3.5+ family still reaches the XML parser.
+    ("/models/qwen3_5_moe", "qwen3_coder"),
+    ("/models/Qwen35-Coder", "qwen3_coder"),
+])
+def test_a_parameter_count_is_not_read_as_a_minor_version(path, expected):
+    """``Qwen3_235B-A3B`` is the OLDER generation with 235B parameters, not Qwen3.235.
+
+    Dense Qwen3 emits hermes-style JSON tool calls; handing it the qwen3_coder XML parser makes
+    every tool call fail to parse, which reads as a broken model rather than a mis-selected
+    parser. Dash-separated paths never hit this, so it only shows up on local directory names.
+    """
+    from freetoken.server.args import parse_args
+
+    empty = SimpleNamespace(architectures=[], model_type="", to_dict=lambda: {})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _p: empty):
+        args, _ = parse_args(["--model", path])
+    assert args.tool_call_parser == expected
