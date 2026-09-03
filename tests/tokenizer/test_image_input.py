@@ -237,12 +237,12 @@ def test_a_span_wider_than_one_chunk_is_rejected_not_fatal():
     REQUEST -- return None so the caller's release path runs, because raising from the
     chunker took the whole scheduler worker down."""
     pending = _pending(20000, img_at=slice(100, 10100), n_img=10000, tok_id=151655)
-    adder = _adder(8192, 20000)
+    adder = _adder(8192, 20000)  # span 10000 > 8192, the largest chunk this server schedules
     got = adder._add_one_req(
         pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
     )
     assert got is None
-    assert [uid for uid, _ in adder.rejected] == [9]
+    assert [uid for uid, _, _ in adder.rejected] == [9]
     reason = adder.rejected[0][1]
     assert "[100, 10100)" in reason and "cannot be split" in reason and "10000" in reason
 
@@ -276,13 +276,13 @@ def test_an_unlocatable_image_span_keeps_the_all_or_nothing_rule():
         pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
     )
     assert got is None, "must return None so the caller releases the pass's resources"
-    assert [uid for uid, _ in adder.rejected] == [9]
+    assert [uid for uid, _, _ in adder.rejected] == [9]
     reason = adder.rejected[0][1]
     assert "9383" in reason and "8192" in reason and "one prefill chunk" in reason
 
     mgr = PrefillManager(cache_manager=None, table_manager=None, decode_manager=None)
     mgr.rejections.extend(adder.rejected)
-    assert mgr.drain_rejections() == [(9, reason)]
+    assert mgr.drain_rejections() == [(9, reason, None)]
     assert mgr.drain_rejections() == [], "draining is one-shot"
 
 
@@ -343,3 +343,123 @@ def test_probe_failure_disables_images_rather_than_blocking_startup(monkeypatch)
     monkeypatch.setenv("FREETOKEN_LOAD_VISION", "1")
     monkeypatch.setattr(weight_mod, "_spec_for_model_path", _boom)
     assert _image_processor_path("nonexistent/model") is None
+
+
+# ------------------------------------------------- budget: transient vs terminal
+def test_losing_this_passs_budget_race_declines_instead_of_rejecting():
+    """token_budget is the pass's REMAINDER -- earlier admissions in the same pass spend it.
+    A prompt whose span would fit a full chunk must not be killed for being second in line:
+    decline (None, stays queued) and let it retry at the front of the queue."""
+    pending = _pending(9383, img_at=slice(100, 5000), n_img=4900, tok_id=151655)
+    adder = _adder(8192, 9383)
+    adder.token_budget = 3000  # what an earlier admission this pass left behind
+    got = adder._add_one_req(
+        pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
+    )
+    assert got is None
+    assert adder.rejected == [], "the span fits 8192; nothing about it is terminal"
+
+
+def test_a_span_over_the_full_budget_is_still_terminal():
+    """The other half: no pass can ever hold this one, so waiting is pointless."""
+    pending = _pending(20000, img_at=slice(100, 10100), n_img=10000, tok_id=151655)
+    adder = _adder(8192, 20000)
+    assert adder.max_chunk_budget == 8192
+    got = adder._add_one_req(
+        pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
+    )
+    assert got is None
+    assert [uid for uid, _, _ in adder.rejected] == [9]
+    assert "largest chunk this server will schedule is 8192" in adder.rejected[0][1]
+
+
+def test_rejecting_a_continuation_hands_back_the_prior_chunk():
+    """Earlier chunks already forwarded: dropping the request from the queue leaves nobody to
+    return their KV pages, table row and GDN slots, so the rejection must carry the Req that
+    owns them. A first-chunk rejection has nothing to hand back (the adder released it)."""
+    pending = _pending(20000, img_at=slice(9000, 19000), n_img=10000, tok_id=151655)
+    adder = _adder(8192, 20000)
+    prior = object()
+    got = adder._add_one_req(
+        pending_req=pending, cache_handle=None, table_idx=0, cached_len=8192,
+        chunked_req=prior,
+    )
+    assert got is None
+    uid, _, handed_back = adder.rejected[0]
+    assert uid == 9 and handed_back is prior
+
+
+# --------------------------------------------- the batch-wide image-token count
+
+
+
+# ------------------------------------------------------- the other render paths
+
+def test_the_tokenize_worker_still_carries_inference_mode():
+    """The decorator sat on tokenize_worker until a helper was inserted between them, which
+    silently moved every worker tokenization out of inference_mode."""
+    import freetoken.tokenizer.server as srv
+
+    assert hasattr(srv.tokenize_worker, "__wrapped__"), (
+        "tokenize_worker lost @torch.inference_mode()"
+    )
+    assert not hasattr(srv._image_processor_path, "__wrapped__"), (
+        "the decorator landed on the helper instead"
+    )
+
+
+def test_no_image_support_is_a_client_error_not_a_server_fault():
+    """count_tokens has no per-request isolation to fall back on, so 'this deployment has no
+    vision tower' has to be distinguishable from 'the processor failed to load'."""
+    from freetoken.tokenizer.tokenize import ImageInputUnsupported, TokenizeManager
+
+    mgr = TokenizeManager.__new__(TokenizeManager)
+    mgr._processor_obj = None
+    mgr._processor_lock = __import__("threading").Lock()
+    mgr._processor_path = None
+    with pytest.raises(ImageInputUnsupported):
+        mgr._processor()
+    assert issubclass(ImageInputUnsupported, ValueError), "callers still catch ValueError"
+
+
+def test_a_literal_placeholder_in_the_text_names_itself_in_the_error():
+    """transformers raises StopIteration when the text has more placeholders than images, and
+    str(StopIteration()) is empty -- the client got 'could not encode request: ' and nothing
+    else. Catch it before the processor and say what is wrong."""
+    import io as _io
+    import threading as _threading
+    from types import SimpleNamespace
+
+    from PIL import Image as _Image
+
+    from freetoken.tokenizer.tokenize import TokenizeManager
+
+    class _Proc:
+        image_token = "<|image_pad|>"
+
+        def apply_chat_template(self, messages, **kw):
+            return "user: <|image_pad|> and a literal <|image_pad|> <|image_pad|>"
+
+        def __call__(self, *a, **k):  # pragma: no cover - must not be reached
+            raise AssertionError("the pre-check should have fired first")
+
+    mgr = TokenizeManager.__new__(TokenizeManager)
+    mgr._processor_obj = _Proc()
+    mgr._processor_lock = _threading.Lock()
+    mgr._processor_path = "unused"
+    mgr._logged_effort_maps = set()
+    mgr.effort_profile = lambda: None
+
+    buf = _io.BytesIO()
+    _Image.new("RGB", (4, 4)).save(buf, format="PNG")
+    msg = SimpleNamespace(chat_template_kwargs=None, tools=None)
+    with pytest.raises(ValueError, match=r"2 literal .*image_pad"):
+        mgr.encode_multimodal(msg, [{"role": "user", "content": "x"}], [buf.getvalue()])
+
+
+def test_a_messageless_exception_still_says_something():
+    """`f"{exc or exc!r}"` applies !r to the WHOLE expression, so it reads repr() even for a
+    normal exception. The client should see the message when there is one, the type when
+    there is not."""
+    assert (lambda e: str(e) or repr(e))(ValueError("boom")) == "boom"
+    assert (lambda e: str(e) or repr(e))(StopIteration()) == "StopIteration()"
