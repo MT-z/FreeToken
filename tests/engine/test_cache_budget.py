@@ -288,6 +288,74 @@ def test_mha_kv_cost_simple_full_attention():
     assert fixed == 0
 
 
+def test_engine_auto_moe_cache_plans_against_the_num_pages_override():
+    """#383: --num-tokens / --num-pages is honoured by the pool but was invisible to the
+    planner, so the expert fill was solved against the small kv_reserve floor and the pool
+    then allocated the override on top of an already-full card. The plan has to see the KV
+    the pool will really take -- which costs expert slots, rather than OOMing at boot."""
+    import torch
+
+    from freetoken.engine.engine import Engine
+    from freetoken.kvcache.mha_pool import MHAKVCache
+    from freetoken.models.config import KVCacheGroupSpec
+
+    class StubModelConfig:
+        has_swa_attention = False
+        num_experts = 4
+        num_moe_layers = 2
+
+        def kv_cache_group_specs(self):
+            return [KVCacheGroupSpec(
+                name="full", layer_ids=(0, 1, 2), num_kv_heads=8, head_dim=64, sliding_window=None,
+            )]
+
+        def linear_attention_group(self):
+            return None
+
+    class StubConfig:
+        dtype = torch.float16
+        page_size = 16
+        max_running_req = 4
+        hybrid_swa_cache_mode = "auto"
+        memory_ratio = 0.9
+        moe_prefill_overlap = True
+        kv_reserve_tokens = 0
+        swa_full_tokens_ratio = 0.2
+        swa_num_pages_override = None
+        num_page_override = None
+        model_config = StubModelConfig()
+
+        class tp_info:
+            size = 1
+
+    class StubBanks:
+        quant_format = "bf16"
+        sources = {
+            "gate_up": [torch.zeros(4, 32, 8, dtype=torch.float16)] * 2,
+            "down": [torch.zeros(4, 8, 16, dtype=torch.float16)] * 2,
+        }
+
+    engine = Engine.__new__(Engine)  # bypass __init__/GPU
+    engine._baseline_free = 10_000_000
+    engine._weights_bytes = 1_000_000
+    engine._pool_cls = MHAKVCache
+
+    def plan(pages_override):
+        cfg = StubConfig()
+        cfg.num_page_override = pages_override
+        return engine._resolve_auto_moe_cache_size(cfg, StubBanks())
+
+    # On this stub the expert fill is already at its cap (4 experts x 2 layers all fit), so
+    # KV holds the whole remainder: an override at or below the natural page count changes
+    # nothing and one above it cannot fit. Comparing slot counts therefore separates nothing
+    # -- what separates them is WHERE the failure lands. On main the planner never sees the
+    # override, so an impossible request plans happily and the pool OOMs later; with the
+    # clamp the same request is refused up front, by the budget policy, before any allocation.
+    natural_pages = plan(None)[1]
+    with pytest.raises(AssertionError, match="cache budget too small"):
+        plan(natural_pages + 1)
+
+
 def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
     import torch
 
