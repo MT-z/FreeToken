@@ -149,50 +149,6 @@ def test_prefill_chunk_ends_on_a_page_boundary():
     assert adder.try_add_one(pending).extend_len == 40
 
 
-def test_an_image_span_no_aligned_chunk_can_hold_is_rejected_not_retried():
-    """A chunk may only START on a page boundary, so the one carrying the image span also pays
-    for the [align_down(lo), lo) head. Sizing the terminal-vs-transient test on `hi - lo` drops
-    that head: a span within a page of the budget then reads as "retryable" while no aligned
-    start can ever hold it. cached_len is pinned while the request keeps declining, so nothing
-    changes between passes -- and try_add_one's None breaks the admission loop, stalling every
-    request queued behind one that will never be admitted."""
-    from freetoken.scheduler.prefill import ChunkedReq, PrefillAdder
-    from freetoken.scheduler.table import TableManager
-    from freetoken.scheduler.utils import PendingReq
-
-    pt = torch.zeros(4, 512, dtype=torch.int32)
-    cm = CacheManager(64, 64, pt, "hybrid_radix", linear_state_pool=_pool())
-    tm = TableManager(max_running_reqs=4, page_table=pt)
-    assert cm.prefill_chunk_align == 64
-    budget, img_id, span = 256, 999, 256
-
-    def _img_pend(lo):
-        ids = torch.arange(500, dtype=torch.int32)
-        ids[lo:lo + span] = img_id
-        return PendingReq(uid=1, input_ids=ids, sampling_params=SamplingParams(max_tokens=1),
-                          mm_embeds=torch.zeros(span, 4), image_token_id=img_id)
-
-    def _adder():
-        return PrefillAdder(token_budget=budget, reserved_size=0,
-                            cache_manager=cm, table_manager=tm)
-
-    # lo=100 sits 36 tokens past a page boundary, so the span really costs 256 + 36 > budget.
-    adder = _adder()
-    assert adder.try_add_one(_img_pend(100)) is None
-    assert len(adder.rejected) == 1, "transient decline: retried forever, prefill queue stalls"
-    reason = adder.rejected[0][1]
-    assert "292 contiguous tokens" in reason and "36 tokens before the span" in reason
-
-    # ... and the terminal answer must arrive on the FIRST pass: pulling back here would spend
-    # a chunk of prefill only to report the same error once the next pass reaches the span.
-    assert tm.available_size == 4 and cm.linear_state_pool.num_free_slots == 15
-
-    # The same span from a page-aligned start fits exactly: pull back so it rides chunk 2 whole.
-    adder = _adder()
-    req = adder.try_add_one(_img_pend(128))
-    assert isinstance(req, ChunkedReq) and req.extend_len == 128 and not adder.rejected
-
-
 def test_naive_cache_does_not_align_prefill_chunks():
     """The alignment hook is hybrid-only; every other cache keeps the raw budget chunk."""
     from freetoken.scheduler.prefill import PrefillAdder

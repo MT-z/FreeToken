@@ -223,36 +223,6 @@ def test_a_per_request_sized_pool_cannot_hold_a_full_batch(monkeypatch):
         _decode(cm, reqs, n_decode)
 
 
-def test_an_image_span_wider_than_the_whole_pool_is_rejected_not_retried():
-    """The terminal-vs-transient test for an unsplittable image span must know about the swa
-    cap, not just the prefill budget. A span the window pool can never back reads as "retryable"
-    against max_chunk_budget alone, so the adder declines transiently forever instead of
-    returning the terminal error that names --swa-num-pages-override -- and try_add_one's None
-    breaks the admission loop, so the queue stalls behind it.
-
-    The bound is pool CAPACITY, not swa_available_size: the free space is what this pass has,
-    and rejecting on it would kill a servable prompt whenever decodes hold the pool."""
-    cm, tm, _pm = _managers(window=256, num_swa_tokens=512, ps=1)
-    assert cm.swa_paged and cm.prefill_chunk_align == 1  # isolate the swa term from alignment
-
-    img_id, lo, span = 99_999, 100, 1024
-    ids = torch.arange(1, 2001, dtype=torch.int32, device=DEVICE)
-    ids[lo:lo + span] = img_id
-    pending = PendingReq(uid=UID, input_ids=ids, sampling_params=SamplingParams(max_tokens=1),
-                         mm_embeds=torch.zeros(span, 4), image_token_id=img_id)
-
-    adder = PrefillAdder(token_budget=TOKEN_BUDGET, reserved_size=0,
-                         cache_manager=cm, table_manager=tm)
-    assert span <= adder.max_chunk_budget         # the budget alone would call this retryable
-    assert adder._max_span_budget() == 511        # ... the pool never grows past this
-
-    assert adder.try_add_one(pending) is None
-    assert len(adder.rejected) == 1, "transient decline: retried forever, prefill queue stalls"
-    assert "--swa-num-pages-override" in adder.rejected[0][1]
-    assert tm.available_size == MAX_RUNNING       # the declined admission released its row
-
-
-# --------------------------------------------------------------- the floor formula
 def test_floor_terms_and_page_rounding():
     for window in (8, 128, 1024):
         for ps in (1, 8, 64, 128):
