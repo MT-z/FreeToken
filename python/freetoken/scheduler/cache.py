@@ -381,16 +381,6 @@ class CacheManager:
         slot (final full-sequence state) and free all of the req's slots."""
         from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
 
-        # Donate barrier: settle all in-flight device work before snapshot donation and the
-        # dedup/re-point bookkeeping below. Stream-level wait_stream ordering alone leaves a
-        # window in which a hit admitted alongside in-flight decode restores or donates
-        # corrupted GDN state (reproduced with deterministic ground-truth probes: ~10% wrong
-        # answers under saturation, cold prefill always clean). Fires once per prefill
-        # commit / request finish -- request-level, sub-millisecond.
-        # Guarded: the cache manager is exercised on CPU by the scheduler tests, where an
-        # unconditional cuda.synchronize raises 'Expected a cuda device, but got: cpu'.
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
         pool = self.linear_state_pool
         old_handle = req.cache_handle
         page_indices = self.page_table[req.table_idx, : req.cached_len]
