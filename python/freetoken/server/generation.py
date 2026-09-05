@@ -175,7 +175,7 @@ def resolve_sampling(
     model_sampling: dict[str, Any],
     stop: str | list[str] | None = None,
     min_p: float | None = None,
-    presence_penalty: float = 0.0,
+    presence_penalty: float | None = None,
     frequency_penalty: float = 0.0,
     repetition_penalty: float | None = None,
     logit_bias: dict[str, float] | dict[int, float] | None = None,
@@ -202,7 +202,10 @@ def resolve_sampling(
     resolved_rep = float(pick(repetition_penalty, "repetition_penalty", 1.0))
     if not 0.0 <= resolved_min_p <= 1.0:
         raise ValueError(f"min_p must be in [0, 1], got {resolved_min_p}")
-    for name, value in (("presence_penalty", presence_penalty), ("frequency_penalty", frequency_penalty)):
+    # presence_penalty keeps the None sentinel so an unspecified request still falls through
+    # to --sampling-override; resolve it before the range check, and check the resolved value.
+    resolved_presence = float(pick(presence_penalty, "presence_penalty", 0.0))
+    for name, value in (("presence_penalty", resolved_presence), ("frequency_penalty", frequency_penalty)):
         if not -2.0 <= float(value) <= 2.0:
             raise ValueError(f"{name} must be in [-2, 2], got {value}")
     if resolved_rep <= 0.0:
@@ -233,10 +236,9 @@ def resolve_sampling(
         # request falls through to the deployment's default (--sampling-override
         # presence_penalty=...), which is how a model card's anti-repetition recommendation gets
         # served at all -- generation_config.json cannot express it.
-        presence_penalty=pick(presence_penalty, "presence_penalty", 0.0),
+        presence_penalty=resolved_presence,
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
         min_p=resolved_min_p,
-        presence_penalty=float(presence_penalty),
         frequency_penalty=float(frequency_penalty),
         repetition_penalty=resolved_rep,
         logit_bias=bias,
