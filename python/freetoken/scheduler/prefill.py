@@ -53,30 +53,6 @@ class PrefillAdder:
     # request leaves the queue, so its KV pages / table slot / GDN slots have no other owner
     # left to free them. None for a fresh admission, which this adder releases itself.
     rejected: List[Tuple[int, str, Req | None]] = field(default_factory=list)
-    # The pass's FULL budget, before any admission spent it. token_budget shrinks as requests
-    # are admitted, so it says nothing about what a request could ever get -- rejecting on it
-    # would kill a servable prompt for being second in line this pass.
-    max_chunk_budget: int = 0
-
-    def __post_init__(self) -> None:
-        if self.max_chunk_budget == 0:
-            self.max_chunk_budget = self.token_budget
-
-    def _max_span_budget(self) -> int:
-        """Widest UNSPLITTABLE run a prefill chunk could ever carry, on an idle server. The
-        terminal-vs-transient test for an image span: below this a decline must be transient
-        (the request retries when it reaches the head), at or above it no wait can help and the
-        request has to be told so. max_chunk_budget alone overstates it on a paged-swa model,
-        whose chunk is also capped by the window pool -- and a pool too small for the span
-        never grows into one, so that case must reject rather than retry forever."""
-        budget = self.max_chunk_budget
-        pool = self.cache_manager.swa_pool if self.cache_manager.swa_paged else None
-        if pool is not None:
-            # Total capacity, not swa_available_size: the free space is what THIS pass has, and
-            # rejecting on it would kill a servable prompt whenever decodes hold the pool.
-            budget = min(budget, max(getattr(pool, "swa_num_tokens", budget) - 1, 0))
-        return budget
-
     def _release_admission(self, handle, table_idx, linear_slot_idx, ping_pong) -> None:
         """Undo _try_allocate_one. Nothing has been forwarded, so this is the cheap release:
         drop the prefix-cache lock, hand back the table row, return the GDN slots. Without it
@@ -314,9 +290,6 @@ class PrefillManager:
     # Terminal (uid, reason, prior_chunk) triples produced by the last scheduling pass; the
     # scheduler drains them into error replies and frees prior_chunk when it is not None.
     rejections: List[Tuple[int, str, Req | None]] = field(default_factory=list)
-    #: The model's image token id, so a chunked multimodal prompt can be split anywhere the
-    #: image tokens are not. None on a text-only build, which restores the all-or-nothing rule.
-    image_token_id: int | None = None
 
     def drain_rejections(self) -> List[Tuple[int, str, Req | None]]:
         out, self.rejections = self.rejections, []
@@ -329,7 +302,6 @@ class PrefillManager:
                 req.input_ids,
                 req.sampling_params,
                 mm_embeds=req.mm_embeds,
-                image_token_id=self.image_token_id,
                 cache_ids=req.cache_ids,
             )
         )
