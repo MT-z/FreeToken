@@ -169,9 +169,8 @@ def test_the_shutdown_hook_closes_the_log_even_when_the_states_teardown_raises(t
     monkeypatch.setattr(api_server, "_WIRE", w)
     monkeypatch.setattr(api_server, "_GLOBAL_STATE", SimpleNamespace(shutdown=boom))
     monkeypatch.setattr(api_server, "_SHUTTING_DOWN", threading.Event())
-    with pytest.raises(RuntimeError, match="teardown failed"):
-        with TestClient(api_server.app) as client:
-            client.post("/nowhere", json={"model": "x"})
+    with pytest.raises(RuntimeError, match="teardown failed"), TestClient(api_server.app) as client:
+        client.post("/nowhere", json={"model": "x"})
     assert w._worker is None
     lines = (tmp_path / "wire.log").read_text(encoding="utf-8").splitlines()
     assert lines[-1].startswith("wire: ") and "1 bodies written" in lines[-1]
