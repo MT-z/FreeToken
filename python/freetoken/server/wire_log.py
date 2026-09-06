@@ -15,6 +15,10 @@ Three rules, each learned the hard way:
   replace the files an older log still points at.
 * Nothing fails silently. Dropped and failed writes are counted and reported inside the
   log itself, and a summary line closes it, so a capture that lost data says so.
+* Importing this module changes nothing about the process. No thread, no signal handler,
+  no atexit hook until the first record is queued. The serve closes the log from its
+  lifespan shutdown (which uvicorn runs on SIGTERM/SIGINT, unlike atexit); atexit is
+  only the backstop for the other exits.
 """
 
 from __future__ import annotations
@@ -49,6 +53,7 @@ class WireLog:
         self._seq = itertools.count(1)
         self._queue: queue.Queue[tuple[Any, ...] | None] = queue.Queue(maxsize=max_queue)
         self._worker: threading.Thread | None = None
+        self._closed = False  # set by close(): no worker is (re)started after this
         self._lock = threading.Lock()
         self._fh = None
         self.written_lines = 0
@@ -90,10 +95,10 @@ class WireLog:
                 self.dropped += 1
 
     def _ensure_worker(self) -> None:
-        if self._worker is not None:
+        if self._worker is not None or self._closed:
             return
         with self._lock:
-            if self._worker is not None:
+            if self._worker is not None or self._closed:
                 return
             self._worker = threading.Thread(target=self._loop, name="wire-log-writer", daemon=True)
             self._worker.start()
@@ -164,17 +169,33 @@ class WireLog:
         return self._queue.unfinished_tasks == 0
 
     def close(self, timeout: float = 5.0) -> None:
-        """Write the summary, stop the writer. Idempotent; registered with atexit."""
-        worker, self._worker = self._worker, None
+        """Write the summary, stop the writer. Idempotent; registered with atexit.
+
+        Takes down the worker this instance created and only that one: once ``_closed``
+        is set no producer starts a second writer (which would share the log path). The
+        whole teardown -- queueing the summary, queueing the stop, waiting for the writer
+        -- shares ONE ``timeout`` budget, so a slow disk stalls shutdown at most once.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            worker, self._worker = self._worker, None
         if worker is None:
             return
+        deadline = time.monotonic() + timeout
+
+        def remaining() -> float:
+            return max(0.0, deadline - time.monotonic())
+
         try:
-            self._queue.put(("summary",), timeout=timeout)
-            self._queue.put(None, timeout=timeout)
+            self._queue.put(("summary",), timeout=remaining())
+            self._queue.put(None, timeout=remaining())
         except queue.Full:
-            pass
-        worker.join(timeout)
-        if self._fh is not None:
+            pass  # the writer is stuck; whatever it wrote so far stands, the counters say the rest
+        while worker.is_alive() and remaining() > 0:
+            worker.join(min(0.1, remaining()))
+        if not worker.is_alive() and self._fh is not None:
             try:
                 self._fh.close()
             finally:

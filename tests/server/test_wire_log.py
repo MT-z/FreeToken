@@ -174,3 +174,45 @@ def test_the_shutdown_hook_closes_the_log_even_when_the_states_teardown_raises(t
     assert w._worker is None
     lines = (tmp_path / "wire.log").read_text(encoding="utf-8").splitlines()
     assert lines[-1].startswith("wire: ") and "1 bodies written" in lines[-1]
+
+
+def test_importing_the_module_changes_no_signal_handler_and_starts_nothing():
+    # Measured in a fresh interpreter with the variables unset, because this process has
+    # long since imported the module. An import must not touch SIGINT/SIGTERM/SIGHUP.
+    import subprocess
+
+    code = (
+        "import signal, threading, os\n"
+        "for v in ('FREETOKEN_WIRE_LOG', 'FREETOKEN_WIRE_BODY_DIR'): os.environ.pop(v, None)\n"
+        "sigs = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)\n"
+        "before = [signal.getsignal(s) for s in sigs]; n = threading.active_count()\n"
+        "import freetoken.server.wire_log as W\n"
+        "after = [signal.getsignal(s) for s in sigs]\n"
+        "assert before == after, (before, after)\n"
+        "assert threading.active_count() == n\n"
+        "assert W.WIRE._worker is None and not W.WIRE.enabled()\n"
+        "print('clean')\n"
+    )
+    env = {**os.environ, "PYTHONPATH": _PY}
+    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120, check=False)
+    assert r.returncode == 0 and r.stdout.strip() == "clean", r.stderr[-800:]
+
+
+def test_close_spends_at_most_one_timeout_even_when_the_queue_is_full_and_the_writer_is_stuck(tmp_path, monkeypatch):
+    # Full queue, no consumer: both puts would each wait the whole timeout and the join a
+    # third, tripling the stall the docstring promises to bound. One deadline for all three.
+    import threading
+    import time
+
+    w = _log(tmp_path, max_queue=1)
+    monkeypatch.setattr(w, "_ensure_worker", lambda: None)
+    w.line("a")
+    w.line("b")  # dropped; the queue now holds one item nobody will take
+    stuck = threading.Thread(target=time.sleep, args=(2.0,), daemon=True)
+    stuck.start()
+    w._worker = stuck
+    t = time.perf_counter()
+    w.close(timeout=0.3)
+    elapsed = time.perf_counter() - t
+    assert 0.25 <= elapsed < 0.6, elapsed  # one budget (~0.3), not three (~0.9)
+    assert w._closed and w._worker is None
