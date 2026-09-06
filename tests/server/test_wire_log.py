@@ -115,8 +115,10 @@ def test_the_middleware_logs_through_the_writer_and_never_touches_the_disk_itsel
 
     w = _log(tmp_path)
     monkeypatch.setattr(api_server, "_WIRE", w)
-    with TestClient(api_server.app) as client:
-        r = client.post("/nowhere", json={"model": "x", "messages": []}, headers={"x-api-key": "secret"})
+    # No `with`: the lifespan hooks would shut down whatever _GLOBAL_STATE another test
+    # left behind; the middleware needs neither startup nor state.
+    client = TestClient(api_server.app)
+    r = client.post("/nowhere", json={"model": "x", "messages": []}, headers={"x-api-key": "secret"})
     assert r.status_code == 404
     assert w.flush()
     text = (tmp_path / "wire.log").read_text(encoding="utf-8")
