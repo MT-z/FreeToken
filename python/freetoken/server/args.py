@@ -51,6 +51,10 @@ class ServerArgs(SchedulerConfig):
     # prompt_tokens_details.cached_tokens, Anthropic cache_read_input_tokens, Responses
     # input_tokens_details.cached_tokens). Mirrors sglang's --enable-cache-report.
     enable_cache_report: bool = False
+    # /v1/messages: system-role messages after the first non-system one stay in place as
+    # user turns (prefix cache keeps matching across agent turns). False hoists them all
+    # into the head system block, the pre-stage-4 behaviour.
+    system_in_place: bool = True
     # Comma-separated CORS allow-list for browser/webview clients (e.g. the desktop
     # app). Empty string disables CORS headers entirely; "*" allows any origin.
     cors_origins: str = "tauri://localhost,http://tauri.localhost,http://localhost:1420"
@@ -435,6 +439,21 @@ def parse_args(
         choices=SUPPORTED_CACHE_MANAGER.supported_names(),
         help="KV cache strategy (naive | radix). For hybrid GDN models 'radix' is materialized "
         "as a GDN-aware radix (cross-request GDN-state prefix reuse); pass 'naive' to opt out.",
+    )
+
+    assert ServerArgs.system_in_place == True
+    parser.add_argument(
+        "--no-system-in-place",
+        action="store_false",
+        dest="system_in_place",
+        help=(
+            "/v1/messages: hoist system-role messages that appear mid-conversation "
+            "(e.g. Claude Code's <system-reminder>s) into the head system block, as before "
+            "stage 4 of .claude/DESIGN-system-in-place.md. By default they stay where the "
+            "client put them, as user turns, so the prompt head stops moving and the prefix "
+            "cache matches the previous turn (792 -> 119 s of prefill over a captured session "
+            "on one box). FREETOKEN_SYSTEM_IN_PLACE=0 has the same effect."
+        ),
     )
 
     parser.add_argument(

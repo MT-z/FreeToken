@@ -372,14 +372,30 @@ def convert_anthropic_to_genspec(
 
 
 _SYSTEM_IN_PLACE_ENV = "FREETOKEN_SYSTEM_IN_PLACE"
+_SYSTEM_IN_PLACE: bool | None = None  # set once by the serve from its arguments; None = env only
+
+
+def configure_system_placement(in_place: bool) -> None:
+    """Fix the placement for this process (the serve calls it after parsing arguments, so
+    --no-system-in-place wins over the environment). Tests and offline tools that never
+    call it fall back to FREETOKEN_SYSTEM_IN_PLACE."""
+    global _SYSTEM_IN_PLACE
+    _SYSTEM_IN_PLACE = bool(in_place)
+
+
+def system_in_place_env() -> bool:
+    """FREETOKEN_SYSTEM_IN_PLACE unset/1/true/yes/on -> True; 0/false/no/off -> False."""
+    return os.environ.get(_SYSTEM_IN_PLACE_ENV, "").strip().lower() not in ("0", "false", "no", "off")
 
 
 def _system_in_place() -> bool:
     """Default on (stage 4 of the design): system-role messages that follow the first
-    non-system message stay where they are, as user turns. FREETOKEN_SYSTEM_IN_PLACE=0
-    (or false/no/off) hoists them into the head system block as before. Read per
+    non-system message stay where they are, as user turns; off hoists them into the head
+    system block as before. Configured by the serve, else by the environment; read per
     call so one process can compare both."""
-    return os.environ.get(_SYSTEM_IN_PLACE_ENV, "").strip().lower() not in ("0", "false", "no", "off")
+    if _SYSTEM_IN_PLACE is not None:
+        return _SYSTEM_IN_PLACE
+    return system_in_place_env()
 
 
 def _content_text(content) -> str:

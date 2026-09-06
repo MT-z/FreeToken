@@ -1128,6 +1128,14 @@ def _serve_and_run_shell(host: str, port: int) -> None:
         _reap_backend_workers(_GLOBAL_STATE.backend_processes)
 
 
+def _system_placement(config: ServerArgs) -> bool:
+    """True = keep mid-conversation system messages in place. Either --no-system-in-place
+    or FREETOKEN_SYSTEM_IN_PLACE=0 turns it off; both default to on."""
+    from .anthropic_api import system_in_place_env
+
+    return bool(getattr(config, "system_in_place", True)) and system_in_place_env()
+
+
 def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_shell: bool) -> None:
     """
     Run the frontend API server (FastAPI + uvicorn) and wire it to the tokenizer process via ZMQ.
@@ -1166,6 +1174,20 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _MODEL_SAMPLING.get("presence_penalty", 0.0),
     )
 
+    # /v1/messages: where mid-conversation system-role messages go. Declared at start-up
+    # because nothing else in the logs tells the two prompt shapes apart, and the prefix
+    # cache differs 6x between them (.claude/DESIGN-system-in-place.md).
+    from .anthropic_api import configure_system_placement
+
+    in_place = _system_placement(config)
+    configure_system_placement(in_place)
+    logger.info(
+        "system messages: %s",
+        "in place (mid-conversation system-role messages become user turns; "
+        "--no-system-in-place or FREETOKEN_SYSTEM_IN_PLACE=0 hoists them)"
+        if in_place
+        else "hoisted into the head system block (--no-system-in-place / FREETOKEN_SYSTEM_IN_PLACE=0)",
+    )
     if run_shell:
         assert not config.use_dummy_weight, "Shell mode does not support dummy weights."
 

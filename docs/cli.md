@@ -120,6 +120,7 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--tool-call-parser` | auto | Tool-call format; auto-inferred from the model family |
 | `--reasoning-parser` | auto | Splits chain-of-thought into `reasoning_content`; auto-inferred; `off` disables |
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
+| `--no-system-in-place` | in place | `/v1/messages`: hoist mid-conversation system-role messages (Claude Code's `<system-reminder>`s) into the head system block. By default they stay where the client put them, as user turns, so the prompt head stops moving and the prefix cache matches the previous turn. `FREETOKEN_SYSTEM_IN_PLACE=0` does the same; the serve logs which is in effect |
 
 ## ft shell
 
