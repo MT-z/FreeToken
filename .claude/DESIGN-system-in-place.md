@@ -55,8 +55,7 @@ reminder を **assistant ターンを飛び越えて1ターン後ろへ動かす
 | `own` その場で独立 user ターン | **96.2%** | 33/58 | 保たれる |
 
 一次出力: `freetoken-systest/results/20260907T015806-diag_prefix-cache-placement-3way.json`
-道具: `freetoken-systest/tools/prefix-placement-3way.py`（`prefix-hoist-compare.py` の `place_in_place` を 3 通りで回す。
-`prefix-hoist-compare.py` 単体の `main` は `next` しか測らない）
+道具: `freetoken-systest/tools/prefix-hoist-compare.py --modes next,prev,own`（a0e0d07 以降。それより前の `main` は `next` しか測らなかった）
 
 **「3通り同じ」なのは合計比の話であって、組ごとには一致しない。**
 
@@ -151,9 +150,9 @@ own と next の差                : 最大 1,834 トークン
 
 ## 検証（何をもって「効いた」とするか）
 
-1. **オフライン（GPU 不要）**: `prefix-hoist-compare.py`（`next`）と `prefix-placement-3way.py`（3 通り）で
-   53.0% → 96.2%、悪化組なし。**これは既に測ってある。** 段階 2 では、実装（フラグ ON）の出力が
-   `prefix-placement-3way.py` の `own` 変換と **body ごとにトークン列で一致**することを確認する。
+1. **オフライン（GPU 不要）**: `prefix-hoist-compare.py --modes next,prev,own` で 53.0% → 96.2%、悪化組なし。
+   **これは既に測ってある。** 段階 2 では、実装（フラグ ON）の出力が
+   同じ `place_in_place(o, "own")` の描画と **body ごとにトークン列で一致**することを確認する。
 2. **単体**: 上記2件を含む `tests/server/test_anthropic_api.py` が通る。
 3. **実機（唯一の未測定）**: 同一プロンプト列を冷↔冷で流し、**端から端までの時間**と
    `#cached-token` を新旧で比べる。**トークン一致長ではなく時間で示す。**
@@ -181,7 +180,7 @@ own と next の差                : 最大 1,834 トークン
 ## 段階
 
 1. `own` を `FREETOKEN_SYSTEM_IN_PLACE` の裏に実装。新動作のテストを足す。既定は現状のまま
-2. オフライン比較（`tools/prefix-placement-3way.py` と同じ描画経路）で、実装の出力が測定済みの `own` 変換と body ごとに一致することを確認
+2. オフライン比較（`tools/system-in-place-stage2.py`）で、実装の出力が測定済みの `own` 変換と body ごとに一致することを確認
 3. 実機で新旧の時間を測る（冷↔冷）。出力を1回見る
 4. 数字が出たら既定を反転し、旧動作のテストを置き換える
 
