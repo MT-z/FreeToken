@@ -414,7 +414,7 @@ async def lifespan(_: FastAPI):
             _GLOBAL_STATE.shutdown()
     finally:
         # The wire log's atexit hook never runs when the process dies by SIGTERM (the
-        # pidfile learned the same lesson, see _install_pidfile_release_handlers); this
+        # pidfile learned the same lesson, see _install_stop_signal_handlers); this
         # hook does, so close it here -- even when the state's own teardown raises --
         # and let atexit stay as the backstop for the other exits.
         _WIRE.close()
@@ -502,8 +502,10 @@ def _release_pidfile(path: str) -> None:
             os.unlink(path)
 
 
-def _install_pidfile_release_handlers(path: str) -> None:
-    """Release the pidfile on SIGTERM/SIGHUP even though the process dies by that signal.
+def _install_stop_signal_handlers(pidfile_path: str | None) -> None:
+    """On SIGTERM/SIGHUP, close the wire log and release the pidfile (if one was written)
+    even though the process dies by that signal. Installed unconditionally before uvicorn:
+    the wire log's protection must not depend on whether the pidfile could be written.
 
     uvicorn's ``capture_signals`` (server.py) catches the signal, shuts down, RESTORES the
     handler that was installed before it, then re-raises the signal so the process ends
@@ -525,7 +527,8 @@ def _install_pidfile_release_handlers(path: str) -> None:
 
     def _release_and_chain(signum, frame) -> None:
         _WIRE.close(timeout=2.0)
-        _release_pidfile(path)
+        if pidfile_path:
+            _release_pidfile(pidfile_path)
         prev = previous.get(signum)
         if callable(prev):
             prev(signum, frame)
@@ -1214,9 +1217,10 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
             # and make the next serve look at a stale pid. _release_pidfile only unlinks a file
             # that still names us, so running twice is a no-op.
             atexit.register(_release_pidfile, pidfile_path)
-            # Before uvicorn.run / the shell stop handlers: both re-raise the stopping
-            # signal into whatever handler preceded them, and this has to be it.
-            _install_pidfile_release_handlers(pidfile_path)
+    # Before uvicorn.run / the shell stop handlers: both re-raise the stopping signal into
+    # whatever handler preceded them, and this has to be it. Outside the pidfile block on
+    # purpose: the wire log is closed here too, whether or not a pidfile could be written.
+    _install_stop_signal_handlers(pidfile_path or None)
 
 
     # Create/validate FREETOKEN_API_LOG_DIR and start the writer thread up front, so a

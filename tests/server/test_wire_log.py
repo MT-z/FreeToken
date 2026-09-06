@@ -251,7 +251,7 @@ def test_sighup_reaches_the_stop_signal_chain_which_closes_the_log_before_the_pr
         monkeypatch.setattr(api_server, "_WIRE", w)
         pidfile = tmp_path / "serve.pid"
         pidfile.write_text(str(os.getpid()))
-        api_server._install_pidfile_release_handlers(str(pidfile))
+        api_server._install_stop_signal_handlers(str(pidfile))
         w.line("queued before the hang-up")
         w.body(b"{}")
         signal.getsignal(signal.SIGHUP)(signal.SIGHUP, None)  # deliver it by hand
@@ -261,6 +261,32 @@ def test_sighup_reaches_the_stop_signal_chain_which_closes_the_log_before_the_pr
         lines = (tmp_path / "wire.log").read_text(encoding="utf-8").splitlines()
         assert lines[0] == "queued before the hang-up"
         assert lines[-1].startswith("wire: 1 lines, 1 bodies written") and lines[-1].endswith("0 dropped, 0 failed")
+    finally:
+        for sig, handler in saved.items():
+            signal.signal(sig, handler)
+
+
+def test_the_stop_signal_chain_protects_the_log_even_when_no_pidfile_could_be_written(tmp_path, monkeypatch):
+    # The chain is installed whether or not the pidfile was written; with none, SIGHUP still
+    # drains and closes the log before the default action, and nothing tries to unlink.
+    import signal
+
+    from freetoken.server import api_server
+
+    saved = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    real_kill = os.kill
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: real_kill(pid, 0) if sig == 0 else sent.append((pid, sig)))
+    try:
+        signal.signal(signal.SIGHUP, signal.SIG_DFL)
+        w = _log(tmp_path)
+        monkeypatch.setattr(api_server, "_WIRE", w)
+        api_server._install_stop_signal_handlers(None)
+        w.line("no pidfile, still protected")
+        signal.getsignal(signal.SIGHUP)(signal.SIGHUP, None)
+        assert sent == [(os.getpid(), signal.SIGHUP)] and w._worker is None
+        lines = (tmp_path / "wire.log").read_text(encoding="utf-8").splitlines()
+        assert lines[0] == "no pidfile, still protected" and lines[-1].startswith("wire: 1 lines, 0 bodies written")
     finally:
         for sig, handler in saved.items():
             signal.signal(sig, handler)

@@ -19,7 +19,7 @@ Three rules, each learned the hard way:
   no atexit hook until the first record is queued. The serve closes the log from two
   places it owns: the lifespan shutdown (uvicorn runs it on SIGINT and SIGTERM -- and
   only those) and the stop-signal chain it installs before uvicorn (SIGTERM and SIGHUP,
-  see api_server._install_pidfile_release_handlers). atexit is the backstop for the
+  see api_server._install_stop_signal_handlers). atexit is the backstop for the
   other exits; SIGKILL loses whatever is still queued, as it does for everything.
 """
 
@@ -90,7 +90,7 @@ class WireLog:
 
     def _put(self, item: tuple[Any, ...]) -> None:
         if self._closed:
-            with self._lock:  # nobody will ever write it; say so rather than queue it into the void
+            with self._lock:  # nobody will ever write it; count it rather than queue it into the void
                 self.dropped += 1
             return
         self._ensure_worker()

@@ -15,7 +15,7 @@ import subprocess
 import pytest
 
 from freetoken.server.api_server import (
-    _install_pidfile_release_handlers,
+    _install_stop_signal_handlers,
     _pid_in,
     _pidfile,
     _release_pidfile,
@@ -91,7 +91,7 @@ def test_signal_release_unlinks_then_reraises_with_the_default_handler(tmp_path,
     path = tmp_path / "serve.pid"
     path.write_text(f"{os.getpid()}\n")
     signal.signal(signal.SIGTERM, signal.SIG_DFL)  # what a non-shell serve has before uvicorn
-    _install_pidfile_release_handlers(str(path))
+    _install_stop_signal_handlers(str(path))
     handler = signal.getsignal(signal.SIGTERM)
     assert callable(handler) and handler is not signal.SIG_DFL
 
@@ -108,7 +108,7 @@ def test_signal_release_chains_to_a_callable_previous_handler(tmp_path, monkeypa
     path.write_text(f"{os.getpid()}\n")
     seen: list[int] = []
     signal.signal(signal.SIGHUP, lambda signum, frame: seen.append(signum))  # e.g. the shell stop handler
-    _install_pidfile_release_handlers(str(path))
+    _install_stop_signal_handlers(str(path))
     sent = _capture_reraise(monkeypatch)
 
     signal.getsignal(signal.SIGHUP)(signal.SIGHUP, None)
