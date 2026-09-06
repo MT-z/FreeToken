@@ -127,3 +127,26 @@ def test_the_middleware_logs_through_the_writer_and_never_touches_the_disk_itsel
     bodies = [os.path.join(d, f) for d, _, fs in os.walk(tmp_path / "bodies") for f in fs]
     assert len(bodies) == 1 and json.loads(Path(bodies[0]).read_bytes()) == {"model": "x", "messages": []}
     w.close()
+
+
+def test_the_apps_shutdown_hook_closes_the_log_so_a_sigterm_stop_keeps_its_records(tmp_path, monkeypatch):
+    # uvicorn runs the lifespan shutdown on SIGTERM/SIGINT; atexit does not run when the
+    # process dies by the signal. So the hook, not atexit, is what drains the queue and
+    # writes the closing summary on the exit that actually happens.
+    import threading
+
+    from fastapi.testclient import TestClient
+    from freetoken.server import api_server
+
+    w = _log(tmp_path)
+    monkeypatch.setattr(api_server, "_WIRE", w)
+    monkeypatch.setattr(api_server, "_GLOBAL_STATE", None)
+    monkeypatch.setattr(api_server, "_SHUTTING_DOWN", threading.Event())
+    with TestClient(api_server.app) as client:
+        client.post("/nowhere", json={"model": "x"})
+    # No explicit close(): the lifespan exit must have done it.
+    assert w._worker is None
+    lines = (tmp_path / "wire.log").read_text(encoding="utf-8").splitlines()
+    assert lines[-1].startswith("wire: ") and "1 bodies written" in lines[-1] and lines[-1].endswith("0 dropped, 0 failed")
+    bodies = [f for _, _, fs in os.walk(tmp_path / "bodies") for f in fs]
+    assert bodies == ["req-00001.json"]
