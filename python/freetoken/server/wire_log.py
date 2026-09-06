@@ -16,9 +16,11 @@ Three rules, each learned the hard way:
 * Nothing fails silently. Dropped and failed writes are counted and reported inside the
   log itself, and a summary line closes it, so a capture that lost data says so.
 * Importing this module changes nothing about the process. No thread, no signal handler,
-  no atexit hook until the first record is queued. The serve closes the log from its
-  lifespan shutdown (which uvicorn runs on SIGTERM/SIGINT, unlike atexit); atexit is
-  only the backstop for the other exits.
+  no atexit hook until the first record is queued. The serve closes the log from two
+  places it owns: the lifespan shutdown (uvicorn runs it on SIGINT and SIGTERM -- and
+  only those) and the stop-signal chain it installs before uvicorn (SIGTERM and SIGHUP,
+  see api_server._install_pidfile_release_handlers). atexit is the backstop for the
+  other exits; SIGKILL loses whatever is still queued, as it does for everything.
 """
 
 from __future__ import annotations
@@ -87,6 +89,10 @@ class WireLog:
         return self.run_dir
 
     def _put(self, item: tuple[Any, ...]) -> None:
+        if self._closed:
+            with self._lock:  # nobody will ever write it; say so rather than queue it into the void
+                self.dropped += 1
+            return
         self._ensure_worker()
         try:
             self._queue.put_nowait(item)

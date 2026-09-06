@@ -514,10 +514,17 @@ def _install_pidfile_release_handlers(path: str) -> None:
     unlink). Installing this BEFORE uvicorn makes it
     the handler uvicorn restores and re-raises into: unlink, then chain -- to whatever was
     there (the shell-mode stop handler chains the same way), else SIG_DFL and re-raise, so
-    the exit status still says "killed by SIGTERM"."""
+    the exit status still says "killed by SIGTERM".
+
+    The wire log rides the same chain. uvicorn handles only SIGINT and SIGTERM, so on
+    those the lifespan shutdown has already closed it by the time this runs (close() is
+    idempotent); SIGHUP -- a closed terminal, the usual way a foreground serve dies --
+    reaches nothing else, and without this the writer thread died mid-drain and the log
+    lost its tail and its summary silently. A short budget: the process is dying anyway."""
     previous = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGHUP)}
 
     def _release_and_chain(signum, frame) -> None:
+        _WIRE.close(timeout=2.0)
         _release_pidfile(path)
         prev = previous.get(signum)
         if callable(prev):

@@ -216,3 +216,51 @@ def test_close_spends_at_most_one_timeout_even_when_the_queue_is_full_and_the_wr
     elapsed = time.perf_counter() - t
     assert 0.25 <= elapsed < 0.6, elapsed  # one budget (~0.3), not three (~0.9)
     assert w._closed and w._worker is None
+
+
+def test_a_record_after_close_is_counted_as_dropped_not_queued_into_the_void(tmp_path):
+    w = _log(tmp_path)
+    w.line("before")
+    w.close()
+    w.line("after")
+    assert w.body(b"late") is not None  # the caller still gets a name for its log line
+    assert w.dropped == 2 and w._worker is None and w._queue.unfinished_tasks == 0
+
+
+def test_sighup_reaches_the_stop_signal_chain_which_closes_the_log_before_the_process_dies(tmp_path, monkeypatch):
+    # uvicorn handles SIGINT and SIGTERM only; a closed terminal sends SIGHUP, which goes
+    # straight to the chain api_server installs before uvicorn (the pidfile's). That chain
+    # must drain and close the wire log before re-raising the signal with the default action.
+    import signal
+
+    from freetoken.server import api_server
+
+    saved = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    real_kill = os.kill
+    sent: list[tuple[int, int]] = []
+
+    def fake_kill(pid, sig):  # let liveness probes through, record the re-raise
+        if sig == 0:
+            return real_kill(pid, 0)
+        sent.append((pid, sig))
+
+    monkeypatch.setattr(os, "kill", fake_kill)
+    try:
+        signal.signal(signal.SIGHUP, signal.SIG_DFL)  # what a foreground serve has for SIGHUP
+        w = _log(tmp_path)
+        monkeypatch.setattr(api_server, "_WIRE", w)
+        pidfile = tmp_path / "serve.pid"
+        pidfile.write_text(str(os.getpid()))
+        api_server._install_pidfile_release_handlers(str(pidfile))
+        w.line("queued before the hang-up")
+        w.body(b"{}")
+        signal.getsignal(signal.SIGHUP)(signal.SIGHUP, None)  # deliver it by hand
+        assert sent == [(os.getpid(), signal.SIGHUP)] and signal.getsignal(signal.SIGHUP) is signal.SIG_DFL
+        assert not pidfile.exists()
+        assert w._worker is None  # closed by the chain, not by a later atexit
+        lines = (tmp_path / "wire.log").read_text(encoding="utf-8").splitlines()
+        assert lines[0] == "queued before the hang-up"
+        assert lines[-1].startswith("wire: 1 lines, 1 bodies written") and lines[-1].endswith("0 dropped, 0 failed")
+    finally:
+        for sig, handler in saved.items():
+            signal.signal(sig, handler)
