@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -205,6 +206,7 @@ def resolve_sampling(
     # non-positive value is a client error.
     if max_tokens is not None and max_tokens < 1:
         raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
+<<<<<<< HEAD
     resolved_min_p = float(pick(min_p, "min_p", 0.0))
     resolved_rep = float(pick(repetition_penalty, "repetition_penalty", 1.0))
     if not 0.0 <= resolved_min_p <= 1.0:
@@ -244,6 +246,23 @@ def resolve_sampling(
         # presence_penalty=...), which is how a model card's anti-repetition recommendation gets
         # served at all -- generation_config.json cannot express it.
         presence_penalty=resolved_presence,
+=======
+    resolved_temperature = pick(temperature, "temperature", 0.0)
+    if not math.isfinite(resolved_temperature) or resolved_temperature < 0:
+        raise ValueError(f"temperature must be a finite number >= 0, got {resolved_temperature}")
+    resolved_top_p = pick(top_p, "top_p", 1.0)
+    if not math.isfinite(resolved_top_p) or not 0 < resolved_top_p <= 1:
+        raise ValueError(f"top_p must be in (0, 1], got {resolved_top_p}")
+    resolved_top_k = pick(top_k, "top_k", -1)
+    if resolved_top_k != -1 and resolved_top_k < 1:
+        raise ValueError(f"top_k must be -1 (disabled) or >= 1, got {resolved_top_k}")
+    return SamplingParams(
+        ignore_eos=ignore_eos,
+        max_tokens=DEFAULT_MAX_OUTPUT_TOKENS if max_tokens is None else max_tokens,
+        temperature=resolved_temperature,
+        top_k=resolved_top_k,
+        top_p=resolved_top_p,
+>>>>>>> pr223
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
         min_p=resolved_min_p,
         frequency_penalty=float(frequency_penalty),
