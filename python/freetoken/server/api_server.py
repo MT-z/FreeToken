@@ -482,9 +482,44 @@ def _pidfile(path: str):
     try:
         yield path
     finally:
-        if _pid_in(path) == os.getpid():
-            with contextlib.suppress(OSError):
-                os.unlink(path)
+        _release_pidfile(path)
+
+
+def _release_pidfile(path: str) -> None:
+    """Unlink ``path`` if it still names this process. Idempotent, and it leaves a
+    successor's file alone -- so it can run from the context manager's finally AND from
+    the signal path below, in either order."""
+    if _pid_in(path) == os.getpid():
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
+def _install_pidfile_release_handlers(path: str) -> None:
+    """Release the pidfile on SIGTERM/SIGHUP even though the process dies by that signal.
+
+    uvicorn's ``capture_signals`` (server.py) catches the signal, shuts down, RESTORES the
+    handler that was installed before it, then re-raises the signal so the process ends
+    the way the caller asked. With nothing installed here that original handler is
+    SIG_DFL, the re-raise kills the process outright, ``uvicorn.run`` never returns, and
+    the ``ExitStack`` finally around it never runs -- which is exactly how the pidfile
+    outlived the serve (strace: uvicorn's tgkill, then `killed by SIGTERM`, never an
+    unlink). Installing this BEFORE uvicorn makes it
+    the handler uvicorn restores and re-raises into: unlink, then chain -- to whatever was
+    there (the shell-mode stop handler chains the same way), else SIG_DFL and re-raise, so
+    the exit status still says "killed by SIGTERM"."""
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGHUP)}
+
+    def _release_and_chain(signum, frame) -> None:
+        _release_pidfile(path)
+        prev = previous.get(signum)
+        if callable(prev):
+            prev(signum, frame)
+        else:
+            signal.signal(signum, prev if prev is not None else signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+
+    for sig in previous:
+        signal.signal(sig, _release_and_chain)
 
 
 def _pid_in(path: str) -> int | None:
@@ -1159,6 +1194,9 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
             pidfile_path = ""
         else:
             logger.info("pidfile: wrote %d to %s", os.getpid(), pidfile_path)
+            # Before uvicorn.run / the shell stop handlers: both re-raise the stopping
+            # signal into whatever handler preceded them, and this has to be it.
+            _install_pidfile_release_handlers(pidfile_path)
 
     with stack:
         if run_shell:
