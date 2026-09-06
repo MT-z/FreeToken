@@ -206,7 +206,6 @@ def resolve_sampling(
     # non-positive value is a client error.
     if max_tokens is not None and max_tokens < 1:
         raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
-<<<<<<< HEAD
     resolved_min_p = float(pick(min_p, "min_p", 0.0))
     resolved_rep = float(pick(repetition_penalty, "repetition_penalty", 1.0))
     if not 0.0 <= resolved_min_p <= 1.0:
@@ -235,18 +234,10 @@ def resolve_sampling(
     ids = [int(t) for t in (stop_token_ids or [])]
     if any(t < 0 for t in ids):
         raise ValueError("stop_token_ids must be non-negative token ids")
-    params = SamplingParams(
-        ignore_eos=ignore_eos,
-        max_tokens=DEFAULT_MAX_OUTPUT_TOKENS if max_tokens is None else max_tokens,
-        temperature=pick(temperature, "temperature", 0.0),
-        top_k=pick(top_k, "top_k", -1),
-        top_p=pick(top_p, "top_p", 1.0),
-        # OpenAI's protocol carries this one; Anthropic's does not. Either way an unspecified
-        # request falls through to the deployment's default (--sampling-override
-        # presence_penalty=...), which is how a model card's anti-repetition recommendation gets
-        # served at all -- generation_config.json cannot express it.
-        presence_penalty=resolved_presence,
-=======
+
+    # #223: the three core knobs #393's own validation does not cover. Without them a client
+    # float reaches the sampler: NaN/inf temperature produced '!!!' on this box, and the
+    # out-of-range values were accepted and quietly ignored.
     resolved_temperature = pick(temperature, "temperature", 0.0)
     if not math.isfinite(resolved_temperature) or resolved_temperature < 0:
         raise ValueError(f"temperature must be a finite number >= 0, got {resolved_temperature}")
@@ -256,13 +247,17 @@ def resolve_sampling(
     resolved_top_k = pick(top_k, "top_k", -1)
     if resolved_top_k != -1 and resolved_top_k < 1:
         raise ValueError(f"top_k must be -1 (disabled) or >= 1, got {resolved_top_k}")
-    return SamplingParams(
+    params = SamplingParams(
         ignore_eos=ignore_eos,
         max_tokens=DEFAULT_MAX_OUTPUT_TOKENS if max_tokens is None else max_tokens,
         temperature=resolved_temperature,
         top_k=resolved_top_k,
         top_p=resolved_top_p,
->>>>>>> pr223
+        # OpenAI's protocol carries this one; Anthropic's does not. Either way an unspecified
+        # request falls through to the deployment's default (--sampling-override
+        # presence_penalty=...), which is how a model card's anti-repetition recommendation gets
+        # served at all -- generation_config.json cannot express it.
+        presence_penalty=resolved_presence,
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
         min_p=resolved_min_p,
         frequency_penalty=float(frequency_penalty),
