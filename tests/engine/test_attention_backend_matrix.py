@@ -127,6 +127,43 @@ def test_auto_resolves_per_type(monkeypatch, kind, expected):
     assert config.attention_backend == expected
 
 
+def test_auto_says_so_when_the_kv_dtype_forces_a_different_backend(monkeypatch, caplog):
+    """--kv-cache-dtype names a cache format, not a kernel, but on a box whose auto winner
+    cannot read quantized KV it silently becomes a kernel choice too. Measured on sm_89
+    (RTX 4090, 87k of resident context): `fi` 95.2 tok/s -> `triton` 67.7. The resolved
+    config line prints the backend but never connects it to the flag that caused it."""
+    import logging
+
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("full", attention_backend="auto", kv_quant="fp8")
+    with caplog.at_level(logging.WARNING):
+        _adjust_config(config)
+
+    # fa,fi and fi cannot read the scales; triton can.
+    assert config.attention_backend == "triton"
+    said = [r.getMessage() for r in caplog.records if "cannot be read by" in r.getMessage()]
+    assert said, [r.getMessage() for r in caplog.records]
+    assert "fp8" in said[0] and "triton" in said[0]
+
+
+def test_auto_stays_quiet_when_the_kv_dtype_costs_nothing(monkeypatch, caplog):
+    """The warning has to be about the substitution, not about asking for fp8: a box whose
+    auto winner already reads quantized KV loses nothing and must not be told it did."""
+    import logging
+
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config("swa", attention_backend="auto", kv_quant="fp8")  # SWA -> triton anyway
+    with caplog.at_level(logging.WARNING):
+        _adjust_config(config)
+
+    assert config.attention_backend == "triton"
+    assert not [r for r in caplog.records if "cannot be read by" in r.getMessage()]
+
+
 def test_auto_bsa_sets_block_page_size(monkeypatch):
     # m3_sparse declares page_sizes=(128,): one KV page == one sparse block, and
     # config-time resolution must coerce the page size to match.

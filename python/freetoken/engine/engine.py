@@ -170,6 +170,7 @@ def _resolve_auto_attention_backend(
             ("fi", True),
             ("triton", True),
         ]
+    skipped_for_quant: list[str] = []
     for name, arch_ok in candidates:
         if not arch_ok:
             continue
@@ -178,7 +179,20 @@ def _resolve_auto_attention_backend(
         if not _backend_requirements_met(name):
             continue
         if not _backend_supports_kv_quant(name, kv_quant):
+            # Remember it: the operator asked for a KV dtype, not a backend, and the
+            # substitution is not free. On this box `auto` is `fi` and the fp8-capable
+            # fallback is `triton`, which costs ~29% of decode at 87k of context. The
+            # resolved config line prints the backend but never connects it to the flag
+            # that caused it, so say so here.
+            skipped_for_quant.append(name)
             continue
+        if skipped_for_quant:
+            logger.warning(
+                "--kv-cache-dtype %s cannot be read by %s, so the attention backend is %r "
+                "instead. That is a different kernel, not just a different cache format; "
+                "measure before assuming the KV saving is free.",
+                kv_quant, ", ".join(skipped_for_quant), name,
+            )
         return name
     raise RuntimeError(
         "No attention backend can serve attention types "
