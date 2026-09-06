@@ -38,7 +38,7 @@ messages     = [{"role":"system", "content": "\n\n".join(system_texts)}] + other
    0 本  直後が user
 ```
 
-メッセージ内訳: `user / tool_result のみ` が 22 本、`user / text` は 1 本のみ。
+メッセージ内訳（user 24 本）: `tool_result のみ` 22 本、`text` 1 本、`tool_result + text` 1 本。
 
 **ここが設計の分かれ目。** `tool_result` だけの user メッセージは変換で `role:"tool"` に分解され、
 **user エントリを1つも生まない**。だから「直後の user ターンにマージ」は、
@@ -54,21 +54,33 @@ reminder を **assistant ターンを飛び越えて1ターン後ろへ動かす
 | `prev` 直前の user へ後置 | **96.2%** | 33/58 | 保たれる |
 | `own` その場で独立 user ターン | **96.2%** | 33/58 | 保たれる |
 
-**キャッシュの効きは置き方に依存しない。** だから選択基準は性能ではなく忠実性になる。
+一次出力: `freetoken-systest/results/20260907T015806-diag_prefix-cache-placement-3way.json`
+
+**「3通り同じ」なのは合計比の話であって、組ごとには一致しない。**
+
+```
+3通りの共通長が完全に一致する組 :  1 / 58
+own と prev の差                : 最大    4 トークン
+own と next の差                : 最大 1,834 トークン
+```
+
+つまり `own` と `prev` は実質同じもので、`next` だけが別物。
+**合計比で見るかぎり効きは置き方に依存しない**ので、選択基準は性能ではなく忠実性になる。
 
 ### テンプレートが許す並び（実測）
 
-| 並び | 結果 |
+| 並び（実データに出る順） | 結果 |
 |---|---|
-| `user(reminder), user` | OK |
-| `user(reminder), assistant` | OK（実分布の多数） |
-| `user(reminder), tool` | OK |
+| `user(text), user(reminder), assistant` | OK |
 | `tool, user(reminder), assistant` | OK |
+| 末尾 `user(reminder)` + 生成プロンプト | OK |
+| （対照）途中に `system` を残す | NG `System message must be at the beginning.` |
 
-（初回 NG が出たのは `tool_calls.function.arguments` を JSON 文字列で組んだため。
-このテンプレートは dict を要求する。reminder の位置とは無関係で、対照も同じく NG になった。
-**FreeToken の変換は `json.dumps` で文字列を入れている**が、実機は動いているので
-どこかで整合しているはず。**確認していない。本設計の範囲外。**）
+（手組みで最初に NG が出たのは `tool_calls.function.arguments` を JSON 文字列にしたため。
+**これは reminder と無関係**で、reminder 抜きの対照も同じく NG になる。
+実機ではこの経路を通らない —— `convert_anthropic_prompt` は最後に `render_messages`
+（`anthropic_api.py:323` → `generation.py:275`）を通し、そこで `arguments` が dict に戻る。
+**検証1の前提「道具と実機は同じ変換」はこれで成立する。**）
 
 ---
 
@@ -78,11 +90,23 @@ reminder を **assistant ターンを飛び越えて1ターン後ろへ動かす
 効果が3通り同じ以上、位置を保ち、かつクライアントの構造（reminder は独立した注入）に
 最も近いものを採る。査読文書の**案B**にあたる。**案A（`next`）は採らない。**
 
-**D2. 先頭の system ブロックは変えない。** トップレベル `system` は今までどおり先頭に置く。
-テンプレートの `System message must be at the beginning.` を満たす。
+**この設計でふるまいの差が最も出るのは末尾である。** body 60 本のうち **54 本が system で終わる**。
+`own` では、生成プロンプトの直前のターンが `user(reminder)` になる。描画は通る
+（`</tool_response><|im_end|>` の後に user の reminder、次に `assistant\n<think>`）。
+**検証4の目視は、まずこの形を見る。**
+
+**D2. 「最初の非 system メッセージより前」の system は先頭ブロックへ、それ以降は在置き。**
+トップレベル `system` は今までどおり先頭。加えて、`messages` の先頭に並ぶ `role:"system"` も
+先頭ブロックに入れる。**これを決めないと system ブロックの無いプロンプトが作れてしまう**
+（`tests/server/test_anthropic_api.py:132` の fixture は `messages[0]` が system で
+トップレベル `system` が無い。`own` を素直に当てると role 列が `["user","assistant","user"]` になる）。
+実データでは `messages[0]` が system の body は 60 本中 **0 本**、
+トップレベル `system` が無い body は **1 本**。**正しさとテストのための規則であって、
+実トラフィックでは通らない枝。**
 
 **D3. 連続する途中 system は1つの user ターンにまとめる。** 区切りは `\n\n`（現状の連結と同じ）。
 ターン数の増加を抑え、区切り文字のゆらぎを減らす。
+**ただし実データでは連続する途中 system は 60 本中 0 箇所。害は無いが、今のデータでは通らない枝。**
 
 **D4. 空文字は落とす。** 現状の `if t` フィルタと同じ扱い。
 
@@ -101,11 +125,25 @@ reminder を **assistant ターンを飛び越えて1ターン後ろへ動かす
 
 * `tests/server/test_anthropic_api.py:231` `test_convert_hoists_and_merges_system_messages`
   —— role 列 `["system","user","assistant"]` と system が1本であることを固定している。
-  **新動作では `["system","user","assistant","user"]` になるので書き直しが必要。**
-  D7 の既定が現状のままなら段階1では落ちないが、**段階2で必ず落ちる。**
-  新動作用のテストを段階1で足し、段階2で旧動作のテストを置き換える。
+  **`own` では `["system","user","user","assistant"]` になるので書き直しが必要**（実測）。
+  D7 の既定が現状のままなら段階1では落ちないが、**段階4で必ず落ちる。**
+  新動作用のテストを段階1で足し、段階4で旧動作のテストを置き換える。
 * `tests/server/test_anthropic_api.py:132` `test_convert_system_role_message_and_unknown_block`
-  —— 途中 system を含む。アサーションの確認が要る。
+  —— `messages[0]` が system でトップレベル `system` が無い fixture。
+  **D2 の規則によりこの system は先頭ブロックへ入るので、role 列は現状のまま**
+  `["system","assistant","user"]`。D2 を入れなければ `["user","assistant","user"]` になり落ちる。
+  **この fixture が D2 の必要性を示している。**
+
+---
+
+### 参考: fixture ごとの role 列（実測）
+
+| fixture | 現状 | `next` | `prev` | `own` |
+|---|---|---|---|---|
+| `:231`（トップレベル system 有り） | `system,user,assistant` | `system,user,assistant,user` | `system,user,assistant` | `system,user,user,assistant` |
+| `:132`（`messages[0]` が system） | `system,assistant,user` | `assistant,user` | `user,assistant,user` | `user,assistant,user` |
+
+`:132` の `next` / `prev` / `own` はいずれも **D2 を入れる前**の値。入れれば先頭に system が戻る。
 
 ---
 
@@ -117,6 +155,8 @@ reminder を **assistant ターンを飛び越えて1ターン後ろへ動かす
 3. **実機（唯一の未測定）**: 同一プロンプト列を冷↔冷で流し、**端から端までの時間**と
    `#cached-token` を新旧で比べる。**トークン一致長ではなく時間で示す。**
 4. **出力**: 同じ入力に対する応答を新旧で並べ、**明らかな劣化が無いことを目視で1回**見る。
+   **見る対象は末尾の reminder**（body 60 本中 54 本がこの形）。
+   role が `system` から `user` に変わって直前のターンになるので、差が出るならここに出る。
 
 ---
 
@@ -126,8 +166,11 @@ reminder を **assistant ターンを飛び越えて1ターン後ろへ動かす
   **測るより決める話**であり、本設計では「悪化させない」以上の主張をしない。
 * **他機種。** 途中 system を許すテンプレートでは巻き上げ自体が不要かもしれない。
   テンプレート能力で分岐すべきかは決めていない。D7 のフラグはその判断を先送りできる形にしてある。
-* **96.2% で頭打ちになる理由。** 33/58 組が 99% 以上に届く一方、残りは届かない。
-  原因を追っていない。**相関のまま置く。**
+* ~~**96.2% で頭打ちになる理由。**~~ —— **査読で解けた。キャッシュの欠陥ではない。**
+  B は A に新しいターンを足したものなので、一致率は「足したターンの大きさ」で決まる。
+  尾（総 − 共通）の中央値は、99% に届く 33 組が **191 トークン**、届かない 25 組が **2,321 トークン**。
+  尾が大きい4組の正体は、大きな `tool_result` を足した組（18,403 / 9,657）、
+  除外した `req-00018` をまたぐ組（29,323）、別会話の境界（74,865）。**未解決項目から外す。**
 
 ---
 
