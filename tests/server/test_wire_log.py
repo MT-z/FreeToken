@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
+import threading
 from pathlib import Path
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -290,3 +292,63 @@ def test_the_stop_signal_chain_protects_the_log_even_when_no_pidfile_could_be_wr
     finally:
         for sig, handler in saved.items():
             signal.signal(sig, handler)
+
+
+def test_captures_are_owner_only_because_they_hold_whole_conversations(tmp_path):
+    # request_logger.py:93 keeps request bodies at 0o600 for this reason, and a capture here
+    # is the entire conversation. Under the usual umask a plain open() leaves the log and
+    # every captured body group- and world-readable.
+    w = _log(tmp_path)
+    w.line("secret")
+    assert w.body(b'{"messages":"secret"}') is not None
+    assert w.flush()
+    w.close()
+    bodies = list((tmp_path / "bodies").rglob("req-*.json"))
+    assert len(bodies) == 1
+    assert stat.S_IMODE((tmp_path / "wire.log").stat().st_mode) == 0o600
+    assert stat.S_IMODE(bodies[0].stat().st_mode) == 0o600
+    assert stat.S_IMODE(bodies[0].parent.stat().st_mode) == 0o700
+
+
+def test_a_failing_file_close_is_counted_not_raised_so_the_stop_path_survives(tmp_path):
+    # close() is the first thing the stop-signal handler runs; a full disk raising out of it
+    # would skip releasing the pidfile and chaining the signal.
+    w = _log(tmp_path)
+    w.line("one")
+    assert w.flush()
+
+    class _FullDisk:
+        def close(self):
+            raise OSError(28, "No space left on device")
+
+    w._fh = _FullDisk()
+    w.close()  # must not raise
+    assert w.failed >= 1 and w._fh is None
+
+
+def test_a_record_submitted_while_close_runs_is_never_lost_without_a_count(tmp_path):
+    # The _closed check and the put are one critical section: close() runs from a signal
+    # handler, which Python delivers between bytecodes on the thread the event loop uses.
+    # Whatever happens, the record is either written or counted -- never neither.
+    w = _log(tmp_path)
+    holding = threading.Event()
+    let_go = threading.Event()
+    real_put = w._queue.put_nowait
+
+    def _slow_put(item):
+        holding.set()          # the producer is inside the lock
+        let_go.wait(2.0)
+        return real_put(item)
+
+    w._queue.put_nowait = _slow_put
+    producer = threading.Thread(target=lambda: w.line("racing"))
+    producer.start()
+    assert holding.wait(2.0)
+    closer = threading.Thread(target=w.close)   # must block on the lock the producer holds
+    closer.start()
+    let_go.set()
+    producer.join(5.0)
+    closer.join(5.0)
+    assert not producer.is_alive() and not closer.is_alive()
+    written = (tmp_path / "wire.log").read_text(encoding="utf-8")
+    assert ("racing" in written) != (w.dropped >= 1)  # exactly one of the two, never neither

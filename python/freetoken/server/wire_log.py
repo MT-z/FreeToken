@@ -56,7 +56,8 @@ class WireLog:
         self._queue: queue.Queue[tuple[Any, ...] | None] = queue.Queue(maxsize=max_queue)
         self._worker: threading.Thread | None = None
         self._closed = False  # set by close(): no worker is (re)started after this
-        self._lock = threading.Lock()
+        # Re-entrant: _put holds it across _ensure_worker, which takes it again.
+        self._lock = threading.RLock()
         self._fh = None
         self.written_lines = 0
         self.written_bodies = 0
@@ -89,15 +90,19 @@ class WireLog:
         return self.run_dir
 
     def _put(self, item: tuple[Any, ...]) -> None:
-        if self._closed:
-            with self._lock:  # nobody will ever write it; count it rather than queue it into the void
-                self.dropped += 1
-            return
-        self._ensure_worker()
-        try:
-            self._queue.put_nowait(item)
-        except queue.Full:
-            with self._lock:
+        # The check and the put are ONE critical section. close() runs from the stop-signal
+        # handler, which Python delivers between bytecodes on the very thread the event loop
+        # runs on, so a check outside the lock can be followed by a completed close(): the
+        # record then lands in a stopped queue and is lost with dropped=0 and failed=0 --
+        # exactly the silent loss this module exists to prevent.
+        with self._lock:
+            if self._closed:
+                self.dropped += 1  # nobody will ever write it; count it rather than queue it
+                return
+            self._ensure_worker()
+            try:
+                self._queue.put_nowait(item)
+            except queue.Full:
                 self.dropped += 1
 
     def _ensure_worker(self) -> None:
@@ -131,8 +136,15 @@ class WireLog:
                 self._try_line(self.summary())  # computed by the writer, after everything before it
             else:
                 _, name, raw = item
-                os.makedirs(os.path.dirname(name), exist_ok=True)
-                with open(name, "xb") as fh:  # exclusive: never replace an existing capture
+                # 0o700 / 0o600: a capture is the whole conversation. request_logger.py:93
+                # keeps its bodies owner-only for the same reason; under the usual umask a
+                # plain open() would leave these group- and world-readable.
+                directory = os.path.dirname(name)
+                if not os.path.isdir(directory):
+                    os.makedirs(directory, mode=0o700, exist_ok=True)
+                    os.chmod(directory, 0o700)  # makedirs' mode is masked by the umask
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)  # never replace a capture
+                with os.fdopen(fd, "wb") as fh:
                     fh.write(raw)
                 self.written_bodies += 1
         except Exception as exc:  # noqa: BLE001 -- the writer must outlive any one failure
@@ -142,7 +154,10 @@ class WireLog:
 
     def _write_line(self, text: str) -> None:
         if self._fh is None:
-            self._fh = open(self.log_path, "a", encoding="utf-8")  # noqa: SIM115 -- kept open by the writer
+            # 0o600 like request_logger.py:93: the log carries request bodies (capped) and
+            # the names of the capture files.
+            fd = os.open(self.log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            self._fh = os.fdopen(fd, "a", encoding="utf-8")  # noqa: SIM115 -- kept open by the writer
         self._fh.write(text + "\n")
         self._fh.flush()
 
@@ -202,8 +217,14 @@ class WireLog:
         while worker.is_alive() and remaining() > 0:
             worker.join(min(0.1, remaining()))
         if not worker.is_alive() and self._fh is not None:
+            # A full disk raises from close(). close() is the FIRST thing the stop-signal
+            # handler runs (api_server._install_stop_signal_handlers), so letting this out
+            # would skip releasing the pidfile and chaining the signal -- a diagnostic
+            # failure aborting the real stop. Count it and carry on.
             try:
                 self._fh.close()
+            except Exception:  # noqa: BLE001 -- the stop path must outlive a broken log
+                self.failed += 1
             finally:
                 self._fh = None
 
