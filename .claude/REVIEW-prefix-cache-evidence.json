@@ -2,12 +2,15 @@
  "measured": "2026-09-07, one real Claude Code session on this box",
  "model": "ornith-ai/Ornith-1.5-35B-A3B-NVFP4",
  "method": "freetoken-systest/tools/prefix-hoist-compare.py (tokenizer only, no GPU)",
- "source_results": "freetoken-systest/results/20260907T013123-diag_prefix-cache-hoist-compare.json",
- "note": "lengths and body hashes only; no conversation content",
+ "source_results": "freetoken-systest/results/20260907T014425-diag_prefix-cache-hoist-compare.json",
+ "note": "lengths, structure counts and body hashes only; no conversation content",
+ "unchanged_threshold_tokens": 100,
  "pairs_total": 58,
  "improved": 41,
  "regressed": 0,
  "unchanged": 17,
+ "strict_regressed": 2,
+ "worst_delta_tokens": -10,
  "skipped": [
   {
    "file": "req-00018.json",
@@ -18,6 +21,16 @@
   {
    "pair": "req-00001.json->req-00002.json",
    "sha256_16": "f17aa2b95fd15ac3",
+   "shape_a": {
+    "msgs": 2,
+    "mid_system": 1,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 5,
+    "mid_system": 2,
+    "tools": 15
+   },
    "tokens_now": 26134,
    "tokens_inplace": 26142,
    "common_now": 20557,
@@ -28,6 +41,16 @@
   {
    "pair": "req-00002.json->req-00003.json",
    "sha256_16": "e7b5fc270b98c6eb",
+   "shape_a": {
+    "msgs": 5,
+    "mid_system": 2,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 8,
+    "mid_system": 3,
+    "tools": 15
+   },
    "tokens_now": 27148,
    "tokens_inplace": 27160,
    "common_now": 21169,
@@ -38,6 +61,16 @@
   {
    "pair": "req-00003.json->req-00004.json",
    "sha256_16": "490f82b826ef3f61",
+   "shape_a": {
+    "msgs": 8,
+    "mid_system": 3,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 11,
+    "mid_system": 4,
+    "tools": 15
+   },
    "tokens_now": 27708,
    "tokens_inplace": 27724,
    "common_now": 21188,
@@ -48,6 +81,16 @@
   {
    "pair": "req-00004.json->req-00005.json",
    "sha256_16": "d79c254943ddc3e6",
+   "shape_a": {
+    "msgs": 11,
+    "mid_system": 4,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 11,
+    "mid_system": 4,
+    "tools": 15
+   },
    "tokens_now": 27846,
    "tokens_inplace": 27858,
    "common_now": 27704,
@@ -58,6 +101,16 @@
   {
    "pair": "req-00005.json->req-00006.json",
    "sha256_16": "2e356f726cd23531",
+   "shape_a": {
+    "msgs": 11,
+    "mid_system": 4,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 14,
+    "mid_system": 5,
+    "tools": 15
+   },
    "tokens_now": 27985,
    "tokens_inplace": 28005,
    "common_now": 21207,
@@ -68,6 +121,16 @@
   {
    "pair": "req-00006.json->req-00008.json",
    "sha256_16": "a2e10b6c151993b9",
+   "shape_a": {
+    "msgs": 14,
+    "mid_system": 5,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 20,
+    "mid_system": 7,
+    "tools": 15
+   },
    "tokens_now": 36531,
    "tokens_inplace": 36559,
    "common_now": 21226,
@@ -78,6 +141,16 @@
   {
    "pair": "req-00008.json->req-00009.json",
    "sha256_16": "51373d1278348318",
+   "shape_a": {
+    "msgs": 20,
+    "mid_system": 7,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 19,
+    "mid_system": 6,
+    "tools": 15
+   },
    "tokens_now": 36681,
    "tokens_inplace": 36701,
    "common_now": 21245,
@@ -88,6 +161,16 @@
   {
    "pair": "req-00009.json->req-00010.json",
    "sha256_16": "43b7f4109259f52c",
+   "shape_a": {
+    "msgs": 19,
+    "mid_system": 6,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 23,
+    "mid_system": 8,
+    "tools": 15
+   },
    "tokens_now": 36717,
    "tokens_inplace": 36749,
    "common_now": 21245,
@@ -98,6 +181,16 @@
   {
    "pair": "req-00010.json->req-00011.json",
    "sha256_16": "9c7e904d95c18096",
+   "shape_a": {
+    "msgs": 23,
+    "mid_system": 8,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 26,
+    "mid_system": 9,
+    "tools": 15
+   },
    "tokens_now": 36991,
    "tokens_inplace": 37027,
    "common_now": 21283,
@@ -108,6 +201,16 @@
   {
    "pair": "req-00011.json->req-00012.json",
    "sha256_16": "422d3b86976bf0ee",
+   "shape_a": {
+    "msgs": 26,
+    "mid_system": 9,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 29,
+    "mid_system": 10,
+    "tools": 15
+   },
    "tokens_now": 37556,
    "tokens_inplace": 37596,
    "common_now": 21302,
@@ -118,6 +221,16 @@
   {
    "pair": "req-00012.json->req-00013.json",
    "sha256_16": "2cd763b29a7ec6e0",
+   "shape_a": {
+    "msgs": 29,
+    "mid_system": 10,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 32,
+    "mid_system": 11,
+    "tools": 15
+   },
    "tokens_now": 38116,
    "tokens_inplace": 38160,
    "common_now": 21321,
@@ -128,6 +241,16 @@
   {
    "pair": "req-00013.json->req-00014.json",
    "sha256_16": "2ee207e071cfa4de",
+   "shape_a": {
+    "msgs": 32,
+    "mid_system": 11,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 32,
+    "mid_system": 11,
+    "tools": 15
+   },
    "tokens_now": 38254,
    "tokens_inplace": 38294,
    "common_now": 38112,
@@ -138,6 +261,16 @@
   {
    "pair": "req-00014.json->req-00015.json",
    "sha256_16": "f9e7bef479abb30f",
+   "shape_a": {
+    "msgs": 32,
+    "mid_system": 11,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 35,
+    "mid_system": 12,
+    "tools": 15
+   },
    "tokens_now": 56485,
    "tokens_inplace": 56533,
    "common_now": 21340,
@@ -148,6 +281,16 @@
   {
    "pair": "req-00015.json->req-00016.json",
    "sha256_16": "5ad64822bbf41f55",
+   "shape_a": {
+    "msgs": 35,
+    "mid_system": 12,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 38,
+    "mid_system": 13,
+    "tools": 15
+   },
    "tokens_now": 56998,
    "tokens_inplace": 57050,
    "common_now": 21359,
@@ -158,6 +301,16 @@
   {
    "pair": "req-00016.json->req-00017.json",
    "sha256_16": "850ee5a62317e0bf",
+   "shape_a": {
+    "msgs": 38,
+    "mid_system": 13,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 38,
+    "mid_system": 13,
+    "tools": 15
+   },
    "tokens_now": 57155,
    "tokens_inplace": 57203,
    "common_now": 56994,
@@ -168,6 +321,16 @@
   {
    "pair": "req-00017.json->req-00019.json",
    "sha256_16": "a9f790d259272c4c",
+   "shape_a": {
+    "msgs": 38,
+    "mid_system": 13,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 41,
+    "mid_system": 14,
+    "tools": 15
+   },
    "tokens_now": 86287,
    "tokens_inplace": 86343,
    "common_now": 21378,
@@ -178,6 +341,16 @@
   {
    "pair": "req-00019.json->req-00020.json",
    "sha256_16": "fa7e3f134abe9ecf",
+   "shape_a": {
+    "msgs": 41,
+    "mid_system": 14,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 44,
+    "mid_system": 15,
+    "tools": 15
+   },
    "tokens_now": 95820,
    "tokens_inplace": 95880,
    "common_now": 21490,
@@ -188,6 +361,16 @@
   {
    "pair": "req-00020.json->req-00021.json",
    "sha256_16": "f4975e535b2b16d7",
+   "shape_a": {
+    "msgs": 44,
+    "mid_system": 15,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 44,
+    "mid_system": 15,
+    "tools": 15
+   },
    "tokens_now": 95977,
    "tokens_inplace": 96033,
    "common_now": 95816,
@@ -198,6 +381,16 @@
   {
    "pair": "req-00021.json->req-00022.json",
    "sha256_16": "89ad94c2e6601a51",
+   "shape_a": {
+    "msgs": 44,
+    "mid_system": 15,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 47,
+    "mid_system": 16,
+    "tools": 15
+   },
    "tokens_now": 103565,
    "tokens_inplace": 103629,
    "common_now": 21509,
@@ -208,6 +401,16 @@
   {
    "pair": "req-00022.json->req-00023.json",
    "sha256_16": "ac6a3a822861cffb",
+   "shape_a": {
+    "msgs": 47,
+    "mid_system": 16,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 47,
+    "mid_system": 16,
+    "tools": 15
+   },
    "tokens_now": 103718,
    "tokens_inplace": 103778,
    "common_now": 103561,
@@ -218,6 +421,16 @@
   {
    "pair": "req-00023.json->req-00024.json",
    "sha256_16": "8b6ddbf4b418d6d2",
+   "shape_a": {
+    "msgs": 47,
+    "mid_system": 16,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 50,
+    "mid_system": 17,
+    "tools": 15
+   },
    "tokens_now": 103829,
    "tokens_inplace": 103897,
    "common_now": 21528,
@@ -228,6 +441,16 @@
   {
    "pair": "req-00024.json->req-00025.json",
    "sha256_16": "8499712ef58c5080",
+   "shape_a": {
+    "msgs": 50,
+    "mid_system": 17,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 49,
+    "mid_system": 16,
+    "tools": 15
+   },
    "tokens_now": 103998,
    "tokens_inplace": 104058,
    "common_now": 21528,
@@ -238,6 +461,16 @@
   {
    "pair": "req-00025.json->req-00026.json",
    "sha256_16": "e10ed2ca8299a705",
+   "shape_a": {
+    "msgs": 49,
+    "mid_system": 16,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 53,
+    "mid_system": 18,
+    "tools": 15
+   },
    "tokens_now": 104146,
    "tokens_inplace": 104218,
    "common_now": 21528,
@@ -248,6 +481,16 @@
   {
    "pair": "req-00026.json->req-00027.json",
    "sha256_16": "ea26d96a31984936",
+   "shape_a": {
+    "msgs": 53,
+    "mid_system": 18,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 56,
+    "mid_system": 19,
+    "tools": 15
+   },
    "tokens_now": 104433,
    "tokens_inplace": 104509,
    "common_now": 21566,
@@ -258,6 +501,16 @@
   {
    "pair": "req-00027.json->req-00028.json",
    "sha256_16": "cde8dd3239de9e61",
+   "shape_a": {
+    "msgs": 56,
+    "mid_system": 19,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 56,
+    "mid_system": 19,
+    "tools": 15
+   },
    "tokens_now": 104590,
    "tokens_inplace": 104662,
    "common_now": 104429,
@@ -268,6 +521,16 @@
   {
    "pair": "req-00028.json->req-00029.json",
    "sha256_16": "94204c5724553065",
+   "shape_a": {
+    "msgs": 56,
+    "mid_system": 19,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 59,
+    "mid_system": 20,
+    "tools": 15
+   },
    "tokens_now": 104654,
    "tokens_inplace": 104734,
    "common_now": 21585,
@@ -278,6 +541,16 @@
   {
    "pair": "req-00029.json->req-00030.json",
    "sha256_16": "5bca2ac16487b712",
+   "shape_a": {
+    "msgs": 59,
+    "mid_system": 20,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 58,
+    "mid_system": 19,
+    "tools": 15
+   },
    "tokens_now": 104823,
    "tokens_inplace": 104895,
    "common_now": 21585,
@@ -288,6 +561,16 @@
   {
    "pair": "req-00030.json->req-00031.json",
    "sha256_16": "2a12c69154fb19ed",
+   "shape_a": {
+    "msgs": 58,
+    "mid_system": 19,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 62,
+    "mid_system": 21,
+    "tools": 15
+   },
    "tokens_now": 105000,
    "tokens_inplace": 105084,
    "common_now": 21585,
@@ -298,6 +581,16 @@
   {
    "pair": "req-00031.json->req-00032.json",
    "sha256_16": "fbb24b29c4727eaf",
+   "shape_a": {
+    "msgs": 62,
+    "mid_system": 21,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 65,
+    "mid_system": 22,
+    "tools": 15
+   },
    "tokens_now": 105634,
    "tokens_inplace": 105722,
    "common_now": 21623,
@@ -308,6 +601,16 @@
   {
    "pair": "req-00032.json->req-00033.json",
    "sha256_16": "daef50bfcc67a06f",
+   "shape_a": {
+    "msgs": 65,
+    "mid_system": 22,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 65,
+    "mid_system": 22,
+    "tools": 15
+   },
    "tokens_now": 105801,
    "tokens_inplace": 105885,
    "common_now": 105630,
@@ -318,6 +621,16 @@
   {
    "pair": "req-00033.json->req-00034.json",
    "sha256_16": "72ebe2d0e1964b11",
+   "shape_a": {
+    "msgs": 65,
+    "mid_system": 22,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 68,
+    "mid_system": 23,
+    "tools": 15
+   },
    "tokens_now": 106143,
    "tokens_inplace": 106235,
    "common_now": 21642,
@@ -328,6 +641,16 @@
   {
    "pair": "req-00034.json->req-00035.json",
    "sha256_16": "b4142fd2e9150ae1",
+   "shape_a": {
+    "msgs": 68,
+    "mid_system": 23,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 71,
+    "mid_system": 24,
+    "tools": 15
+   },
    "tokens_now": 106474,
    "tokens_inplace": 106570,
    "common_now": 21661,
@@ -338,6 +661,16 @@
   {
    "pair": "req-00035.json->req-00036.json",
    "sha256_16": "63674b35c1659846",
+   "shape_a": {
+    "msgs": 71,
+    "mid_system": 24,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 71,
+    "mid_system": 24,
+    "tools": 15
+   },
    "tokens_now": 106641,
    "tokens_inplace": 106733,
    "common_now": 106470,
@@ -348,6 +681,16 @@
   {
    "pair": "req-00036.json->req-00037.json",
    "sha256_16": "43f9924797a01740",
+   "shape_a": {
+    "msgs": 71,
+    "mid_system": 24,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 74,
+    "mid_system": 25,
+    "tools": 15
+   },
    "tokens_now": 108839,
    "tokens_inplace": 108939,
    "common_now": 21680,
@@ -358,6 +701,16 @@
   {
    "pair": "req-00037.json->req-00038.json",
    "sha256_16": "adb66ad7f1fbe472",
+   "shape_a": {
+    "msgs": 74,
+    "mid_system": 25,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 74,
+    "mid_system": 25,
+    "tools": 15
+   },
    "tokens_now": 109062,
    "tokens_inplace": 109158,
    "common_now": 108835,
@@ -368,6 +721,16 @@
   {
    "pair": "req-00038.json->req-00039.json",
    "sha256_16": "aff6beb1627809f8",
+   "shape_a": {
+    "msgs": 74,
+    "mid_system": 25,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 77,
+    "mid_system": 26,
+    "tools": 15
+   },
    "tokens_now": 111126,
    "tokens_inplace": 111230,
    "common_now": 21699,
@@ -378,6 +741,16 @@
   {
    "pair": "req-00039.json->req-00040.json",
    "sha256_16": "28d13074f43dc6a0",
+   "shape_a": {
+    "msgs": 77,
+    "mid_system": 26,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 77,
+    "mid_system": 26,
+    "tools": 15
+   },
    "tokens_now": 111345,
    "tokens_inplace": 111445,
    "common_now": 111122,
@@ -388,6 +761,16 @@
   {
    "pair": "req-00040.json->req-00041.json",
    "sha256_16": "f420c302169d7074",
+   "shape_a": {
+    "msgs": 77,
+    "mid_system": 26,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 80,
+    "mid_system": 27,
+    "tools": 15
+   },
    "tokens_now": 119626,
    "tokens_inplace": 119734,
    "common_now": 21718,
@@ -398,6 +781,16 @@
   {
    "pair": "req-00041.json->req-00042.json",
    "sha256_16": "a72f721e91a05122",
+   "shape_a": {
+    "msgs": 80,
+    "mid_system": 27,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 80,
+    "mid_system": 27,
+    "tools": 15
+   },
    "tokens_now": 119784,
    "tokens_inplace": 119888,
    "common_now": 119622,
@@ -408,6 +801,16 @@
   {
    "pair": "req-00042.json->req-00043.json",
    "sha256_16": "cb8b358f39866630",
+   "shape_a": {
+    "msgs": 80,
+    "mid_system": 27,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 83,
+    "mid_system": 28,
+    "tools": 15
+   },
    "tokens_now": 121790,
    "tokens_inplace": 121902,
    "common_now": 21737,
@@ -418,6 +821,16 @@
   {
    "pair": "req-00043.json->req-00044.json",
    "sha256_16": "ec4c5de70fe2470a",
+   "shape_a": {
+    "msgs": 83,
+    "mid_system": 28,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 83,
+    "mid_system": 28,
+    "tools": 15
+   },
    "tokens_now": 121947,
    "tokens_inplace": 122055,
    "common_now": 121786,
@@ -428,6 +841,16 @@
   {
    "pair": "req-00044.json->req-00045.json",
    "sha256_16": "2a68673f6fa00342",
+   "shape_a": {
+    "msgs": 83,
+    "mid_system": 28,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 86,
+    "mid_system": 29,
+    "tools": 15
+   },
    "tokens_now": 122198,
    "tokens_inplace": 122314,
    "common_now": 21756,
@@ -438,6 +861,16 @@
   {
    "pair": "req-00045.json->req-00046.json",
    "sha256_16": "6da849ed4f891892",
+   "shape_a": {
+    "msgs": 86,
+    "mid_system": 29,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 86,
+    "mid_system": 29,
+    "tools": 15
+   },
    "tokens_now": 122353,
    "tokens_inplace": 122465,
    "common_now": 122194,
@@ -448,6 +881,16 @@
   {
    "pair": "req-00046.json->req-00047.json",
    "sha256_16": "ab84ddd8a0a4c5b2",
+   "shape_a": {
+    "msgs": 86,
+    "mid_system": 29,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 89,
+    "mid_system": 30,
+    "tools": 15
+   },
    "tokens_now": 126172,
    "tokens_inplace": 126292,
    "common_now": 21775,
@@ -458,6 +901,16 @@
   {
    "pair": "req-00047.json->req-00048.json",
    "sha256_16": "23570e841fd9e8d0",
+   "shape_a": {
+    "msgs": 89,
+    "mid_system": 30,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 89,
+    "mid_system": 30,
+    "tools": 15
+   },
    "tokens_now": 126327,
    "tokens_inplace": 126443,
    "common_now": 126168,
@@ -468,6 +921,16 @@
   {
    "pair": "req-00048.json->req-00049.json",
    "sha256_16": "00c0308a907036c9",
+   "shape_a": {
+    "msgs": 89,
+    "mid_system": 30,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 92,
+    "mid_system": 31,
+    "tools": 15
+   },
    "tokens_now": 127562,
    "tokens_inplace": 127686,
    "common_now": 21794,
@@ -478,6 +941,16 @@
   {
    "pair": "req-00049.json->req-00050.json",
    "sha256_16": "d693204122826b12",
+   "shape_a": {
+    "msgs": 92,
+    "mid_system": 31,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 92,
+    "mid_system": 31,
+    "tools": 15
+   },
    "tokens_now": 127717,
    "tokens_inplace": 127837,
    "common_now": 127558,
@@ -488,6 +961,16 @@
   {
    "pair": "req-00050.json->req-00051.json",
    "sha256_16": "1e49156556427eb6",
+   "shape_a": {
+    "msgs": 92,
+    "mid_system": 31,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 95,
+    "mid_system": 32,
+    "tools": 15
+   },
    "tokens_now": 129779,
    "tokens_inplace": 129907,
    "common_now": 21813,
@@ -498,6 +981,16 @@
   {
    "pair": "req-00051.json->req-00052.json",
    "sha256_16": "e1a5c1c033799b0a",
+   "shape_a": {
+    "msgs": 95,
+    "mid_system": 32,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 95,
+    "mid_system": 32,
+    "tools": 15
+   },
    "tokens_now": 129941,
    "tokens_inplace": 130065,
    "common_now": 129775,
@@ -508,6 +1001,16 @@
   {
    "pair": "req-00052.json->req-00053.json",
    "sha256_16": "a51d46c3c4090c96",
+   "shape_a": {
+    "msgs": 95,
+    "mid_system": 32,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 98,
+    "mid_system": 33,
+    "tools": 15
+   },
    "tokens_now": 131838,
    "tokens_inplace": 131970,
    "common_now": 21832,
@@ -518,6 +1021,16 @@
   {
    "pair": "req-00053.json->req-00054.json",
    "sha256_16": "716564df7e55b3d0",
+   "shape_a": {
+    "msgs": 98,
+    "mid_system": 33,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 98,
+    "mid_system": 33,
+    "tools": 15
+   },
    "tokens_now": 131995,
    "tokens_inplace": 132123,
    "common_now": 131834,
@@ -528,6 +1041,16 @@
   {
    "pair": "req-00054.json->req-00055.json",
    "sha256_16": "28c13486d00b4881",
+   "shape_a": {
+    "msgs": 98,
+    "mid_system": 33,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 101,
+    "mid_system": 34,
+    "tools": 15
+   },
    "tokens_now": 135312,
    "tokens_inplace": 135448,
    "common_now": 21851,
@@ -538,6 +1061,16 @@
   {
    "pair": "req-00055.json->req-00056.json",
    "sha256_16": "f4e9973c60187e3a",
+   "shape_a": {
+    "msgs": 101,
+    "mid_system": 34,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 101,
+    "mid_system": 34,
+    "tools": 15
+   },
    "tokens_now": 135477,
    "tokens_inplace": 135609,
    "common_now": 135308,
@@ -548,6 +1081,16 @@
   {
    "pair": "req-00056.json->req-00057.json",
    "sha256_16": "fc82e4dc3d80516c",
+   "shape_a": {
+    "msgs": 101,
+    "mid_system": 34,
+    "tools": 15
+   },
+   "shape_b": {
+    "msgs": 12,
+    "mid_system": 3,
+    "tools": 33
+   },
    "tokens_now": 84588,
    "tokens_inplace": 84596,
    "common_now": 9731,
@@ -558,6 +1101,16 @@
   {
    "pair": "req-00057.json->req-00058.json",
    "sha256_16": "ddb34964ab60a317",
+   "shape_a": {
+    "msgs": 12,
+    "mid_system": 3,
+    "tools": 33
+   },
+   "shape_b": {
+    "msgs": 15,
+    "mid_system": 4,
+    "tools": 33
+   },
    "tokens_now": 85710,
    "tokens_inplace": 85722,
    "common_now": 35156,
@@ -568,6 +1121,16 @@
   {
    "pair": "req-00058.json->req-00059.json",
    "sha256_16": "d1db53d316696cca",
+   "shape_a": {
+    "msgs": 15,
+    "mid_system": 4,
+    "tools": 33
+   },
+   "shape_b": {
+    "msgs": 18,
+    "mid_system": 5,
+    "tools": 33
+   },
    "tokens_now": 94087,
    "tokens_inplace": 94103,
    "common_now": 35260,
@@ -578,6 +1141,16 @@
   {
    "pair": "req-00059.json->req-00060.json",
    "sha256_16": "6d65655ccb691ede",
+   "shape_a": {
+    "msgs": 18,
+    "mid_system": 5,
+    "tools": 33
+   },
+   "shape_b": {
+    "msgs": 21,
+    "mid_system": 6,
+    "tools": 33
+   },
    "tokens_now": 95451,
    "tokens_inplace": 95471,
    "common_now": 35279,
@@ -588,6 +1161,16 @@
   {
    "pair": "req-00060.json->req-00061.json",
    "sha256_16": "5f1164663dd4a717",
+   "shape_a": {
+    "msgs": 21,
+    "mid_system": 6,
+    "tools": 33
+   },
+   "shape_b": {
+    "msgs": 23,
+    "mid_system": 6,
+    "tools": 33
+   },
    "tokens_now": 97222,
    "tokens_inplace": 97238,
    "common_now": 95451,
