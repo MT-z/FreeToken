@@ -1,0 +1,599 @@
+{
+ "measured": "2026-09-07, one real Claude Code session on this box",
+ "model": "ornith-ai/Ornith-1.5-35B-A3B-NVFP4",
+ "method": "freetoken-systest/tools/prefix-hoist-compare.py (tokenizer only, no GPU)",
+ "source_results": "freetoken-systest/results/20260907T013123-diag_prefix-cache-hoist-compare.json",
+ "note": "lengths and body hashes only; no conversation content",
+ "pairs_total": 58,
+ "improved": 41,
+ "regressed": 0,
+ "unchanged": 17,
+ "skipped": [
+  {
+   "file": "req-00018.json",
+   "error": "ValidationError"
+  }
+ ],
+ "pairs": [
+  {
+   "pair": "req-00001.json->req-00002.json",
+   "sha256_16": "f17aa2b95fd15ac3",
+   "tokens_now": 26134,
+   "tokens_inplace": 26142,
+   "common_now": 20557,
+   "common_inplace": 23232,
+   "pct_now": 78.66,
+   "pct_inplace": 88.87
+  },
+  {
+   "pair": "req-00002.json->req-00003.json",
+   "sha256_16": "e7b5fc270b98c6eb",
+   "tokens_now": 27148,
+   "tokens_inplace": 27160,
+   "common_now": 21169,
+   "common_inplace": 25522,
+   "pct_now": 77.98,
+   "pct_inplace": 93.97
+  },
+  {
+   "pair": "req-00003.json->req-00004.json",
+   "sha256_16": "490f82b826ef3f61",
+   "tokens_now": 27708,
+   "tokens_inplace": 27724,
+   "common_now": 21188,
+   "common_inplace": 27133,
+   "pct_now": 76.47,
+   "pct_inplace": 97.87
+  },
+  {
+   "pair": "req-00004.json->req-00005.json",
+   "sha256_16": "d79c254943ddc3e6",
+   "tokens_now": 27846,
+   "tokens_inplace": 27858,
+   "common_now": 27704,
+   "common_inplace": 27694,
+   "pct_now": 99.49,
+   "pct_inplace": 99.41
+  },
+  {
+   "pair": "req-00005.json->req-00006.json",
+   "sha256_16": "2e356f726cd23531",
+   "tokens_now": 27985,
+   "tokens_inplace": 28005,
+   "common_now": 21207,
+   "common_inplace": 27694,
+   "pct_now": 75.78,
+   "pct_inplace": 98.89
+  },
+  {
+   "pair": "req-00006.json->req-00008.json",
+   "sha256_16": "a2e10b6c151993b9",
+   "tokens_now": 36531,
+   "tokens_inplace": 36559,
+   "common_now": 21226,
+   "common_inplace": 27978,
+   "pct_now": 58.1,
+   "pct_inplace": 76.53
+  },
+  {
+   "pair": "req-00008.json->req-00009.json",
+   "sha256_16": "51373d1278348318",
+   "tokens_now": 36681,
+   "tokens_inplace": 36701,
+   "common_now": 21245,
+   "common_inplace": 36529,
+   "pct_now": 57.92,
+   "pct_inplace": 99.53
+  },
+  {
+   "pair": "req-00009.json->req-00010.json",
+   "sha256_16": "43b7f4109259f52c",
+   "tokens_now": 36717,
+   "tokens_inplace": 36749,
+   "common_now": 21245,
+   "common_inplace": 36529,
+   "pct_now": 57.86,
+   "pct_inplace": 99.4
+  },
+  {
+   "pair": "req-00010.json->req-00011.json",
+   "sha256_16": "9c7e904d95c18096",
+   "tokens_now": 36991,
+   "tokens_inplace": 37027,
+   "common_now": 21283,
+   "common_inplace": 36722,
+   "pct_now": 57.54,
+   "pct_inplace": 99.18
+  },
+  {
+   "pair": "req-00011.json->req-00012.json",
+   "sha256_16": "422d3b86976bf0ee",
+   "tokens_now": 37556,
+   "tokens_inplace": 37596,
+   "common_now": 21302,
+   "common_inplace": 37000,
+   "pct_now": 56.72,
+   "pct_inplace": 98.41
+  },
+  {
+   "pair": "req-00012.json->req-00013.json",
+   "sha256_16": "2cd763b29a7ec6e0",
+   "tokens_now": 38116,
+   "tokens_inplace": 38160,
+   "common_now": 21321,
+   "common_inplace": 37569,
+   "pct_now": 55.94,
+   "pct_inplace": 98.45
+  },
+  {
+   "pair": "req-00013.json->req-00014.json",
+   "sha256_16": "2ee207e071cfa4de",
+   "tokens_now": 38254,
+   "tokens_inplace": 38294,
+   "common_now": 38112,
+   "common_inplace": 38130,
+   "pct_now": 99.63,
+   "pct_inplace": 99.57
+  },
+  {
+   "pair": "req-00014.json->req-00015.json",
+   "sha256_16": "f9e7bef479abb30f",
+   "tokens_now": 56485,
+   "tokens_inplace": 56533,
+   "common_now": 21340,
+   "common_inplace": 38130,
+   "pct_now": 37.78,
+   "pct_inplace": 67.45
+  },
+  {
+   "pair": "req-00015.json->req-00016.json",
+   "sha256_16": "5ad64822bbf41f55",
+   "tokens_now": 56998,
+   "tokens_inplace": 57050,
+   "common_now": 21359,
+   "common_inplace": 56506,
+   "pct_now": 37.47,
+   "pct_inplace": 99.05
+  },
+  {
+   "pair": "req-00016.json->req-00017.json",
+   "sha256_16": "850ee5a62317e0bf",
+   "tokens_now": 57155,
+   "tokens_inplace": 57203,
+   "common_now": 56994,
+   "common_inplace": 57020,
+   "pct_now": 99.72,
+   "pct_inplace": 99.68
+  },
+  {
+   "pair": "req-00017.json->req-00019.json",
+   "sha256_16": "a9f790d259272c4c",
+   "tokens_now": 86287,
+   "tokens_inplace": 86343,
+   "common_now": 21378,
+   "common_inplace": 57020,
+   "pct_now": 24.78,
+   "pct_inplace": 66.04
+  },
+  {
+   "pair": "req-00019.json->req-00020.json",
+   "sha256_16": "fa7e3f134abe9ecf",
+   "tokens_now": 95820,
+   "tokens_inplace": 95880,
+   "common_now": 21490,
+   "common_inplace": 86223,
+   "pct_now": 22.43,
+   "pct_inplace": 89.93
+  },
+  {
+   "pair": "req-00020.json->req-00021.json",
+   "sha256_16": "f4975e535b2b16d7",
+   "tokens_now": 95977,
+   "tokens_inplace": 96033,
+   "common_now": 95816,
+   "common_inplace": 95850,
+   "pct_now": 99.83,
+   "pct_inplace": 99.81
+  },
+  {
+   "pair": "req-00021.json->req-00022.json",
+   "sha256_16": "89ad94c2e6601a51",
+   "tokens_now": 103565,
+   "tokens_inplace": 103629,
+   "common_now": 21509,
+   "common_inplace": 95850,
+   "pct_now": 20.77,
+   "pct_inplace": 92.49
+  },
+  {
+   "pair": "req-00022.json->req-00023.json",
+   "sha256_16": "ac6a3a822861cffb",
+   "tokens_now": 103718,
+   "tokens_inplace": 103778,
+   "common_now": 103561,
+   "common_inplace": 103599,
+   "pct_now": 99.85,
+   "pct_inplace": 99.83
+  },
+  {
+   "pair": "req-00023.json->req-00024.json",
+   "sha256_16": "8b6ddbf4b418d6d2",
+   "tokens_now": 103829,
+   "tokens_inplace": 103897,
+   "common_now": 21528,
+   "common_inplace": 103599,
+   "pct_now": 20.73,
+   "pct_inplace": 99.71
+  },
+  {
+   "pair": "req-00024.json->req-00025.json",
+   "sha256_16": "8499712ef58c5080",
+   "tokens_now": 103998,
+   "tokens_inplace": 104058,
+   "common_now": 21528,
+   "common_inplace": 103867,
+   "pct_now": 20.7,
+   "pct_inplace": 99.82
+  },
+  {
+   "pair": "req-00025.json->req-00026.json",
+   "sha256_16": "e10ed2ca8299a705",
+   "tokens_now": 104146,
+   "tokens_inplace": 104218,
+   "common_now": 21528,
+   "common_inplace": 103867,
+   "pct_now": 20.67,
+   "pct_inplace": 99.66
+  },
+  {
+   "pair": "req-00026.json->req-00027.json",
+   "sha256_16": "ea26d96a31984936",
+   "tokens_now": 104433,
+   "tokens_inplace": 104509,
+   "common_now": 21566,
+   "common_inplace": 104191,
+   "pct_now": 20.65,
+   "pct_inplace": 99.7
+  },
+  {
+   "pair": "req-00027.json->req-00028.json",
+   "sha256_16": "cde8dd3239de9e61",
+   "tokens_now": 104590,
+   "tokens_inplace": 104662,
+   "common_now": 104429,
+   "common_inplace": 104479,
+   "pct_now": 99.85,
+   "pct_inplace": 99.83
+  },
+  {
+   "pair": "req-00028.json->req-00029.json",
+   "sha256_16": "94204c5724553065",
+   "tokens_now": 104654,
+   "tokens_inplace": 104734,
+   "common_now": 21585,
+   "common_inplace": 104479,
+   "pct_now": 20.63,
+   "pct_inplace": 99.76
+  },
+  {
+   "pair": "req-00029.json->req-00030.json",
+   "sha256_16": "5bca2ac16487b712",
+   "tokens_now": 104823,
+   "tokens_inplace": 104895,
+   "common_now": 21585,
+   "common_inplace": 104704,
+   "pct_now": 20.59,
+   "pct_inplace": 99.82
+  },
+  {
+   "pair": "req-00030.json->req-00031.json",
+   "sha256_16": "2a12c69154fb19ed",
+   "tokens_now": 105000,
+   "tokens_inplace": 105084,
+   "common_now": 21585,
+   "common_inplace": 104704,
+   "pct_now": 20.56,
+   "pct_inplace": 99.64
+  },
+  {
+   "pair": "req-00031.json->req-00032.json",
+   "sha256_16": "fbb24b29c4727eaf",
+   "tokens_now": 105634,
+   "tokens_inplace": 105722,
+   "common_now": 21623,
+   "common_inplace": 105057,
+   "pct_now": 20.47,
+   "pct_inplace": 99.37
+  },
+  {
+   "pair": "req-00032.json->req-00033.json",
+   "sha256_16": "daef50bfcc67a06f",
+   "tokens_now": 105801,
+   "tokens_inplace": 105885,
+   "common_now": 105630,
+   "common_inplace": 105692,
+   "pct_now": 99.84,
+   "pct_inplace": 99.82
+  },
+  {
+   "pair": "req-00033.json->req-00034.json",
+   "sha256_16": "72ebe2d0e1964b11",
+   "tokens_now": 106143,
+   "tokens_inplace": 106235,
+   "common_now": 21642,
+   "common_inplace": 105692,
+   "pct_now": 20.39,
+   "pct_inplace": 99.49
+  },
+  {
+   "pair": "req-00034.json->req-00035.json",
+   "sha256_16": "b4142fd2e9150ae1",
+   "tokens_now": 106474,
+   "tokens_inplace": 106570,
+   "common_now": 21661,
+   "common_inplace": 106208,
+   "pct_now": 20.34,
+   "pct_inplace": 99.66
+  },
+  {
+   "pair": "req-00035.json->req-00036.json",
+   "sha256_16": "63674b35c1659846",
+   "tokens_now": 106641,
+   "tokens_inplace": 106733,
+   "common_now": 106470,
+   "common_inplace": 106540,
+   "pct_now": 99.84,
+   "pct_inplace": 99.82
+  },
+  {
+   "pair": "req-00036.json->req-00037.json",
+   "sha256_16": "43f9924797a01740",
+   "tokens_now": 108839,
+   "tokens_inplace": 108939,
+   "common_now": 21680,
+   "common_inplace": 106540,
+   "pct_now": 19.92,
+   "pct_inplace": 97.8
+  },
+  {
+   "pair": "req-00037.json->req-00038.json",
+   "sha256_16": "adb66ad7f1fbe472",
+   "tokens_now": 109062,
+   "tokens_inplace": 109158,
+   "common_now": 108835,
+   "common_inplace": 108909,
+   "pct_now": 99.79,
+   "pct_inplace": 99.77
+  },
+  {
+   "pair": "req-00038.json->req-00039.json",
+   "sha256_16": "aff6beb1627809f8",
+   "tokens_now": 111126,
+   "tokens_inplace": 111230,
+   "common_now": 21699,
+   "common_inplace": 108909,
+   "pct_now": 19.53,
+   "pct_inplace": 97.91
+  },
+  {
+   "pair": "req-00039.json->req-00040.json",
+   "sha256_16": "28d13074f43dc6a0",
+   "tokens_now": 111345,
+   "tokens_inplace": 111445,
+   "common_now": 111122,
+   "common_inplace": 111200,
+   "pct_now": 99.8,
+   "pct_inplace": 99.78
+  },
+  {
+   "pair": "req-00040.json->req-00041.json",
+   "sha256_16": "f420c302169d7074",
+   "tokens_now": 119626,
+   "tokens_inplace": 119734,
+   "common_now": 21718,
+   "common_inplace": 111200,
+   "pct_now": 18.15,
+   "pct_inplace": 92.87
+  },
+  {
+   "pair": "req-00041.json->req-00042.json",
+   "sha256_16": "a72f721e91a05122",
+   "tokens_now": 119784,
+   "tokens_inplace": 119888,
+   "common_now": 119622,
+   "common_inplace": 119704,
+   "pct_now": 99.86,
+   "pct_inplace": 99.85
+  },
+  {
+   "pair": "req-00042.json->req-00043.json",
+   "sha256_16": "cb8b358f39866630",
+   "tokens_now": 121790,
+   "tokens_inplace": 121902,
+   "common_now": 21737,
+   "common_inplace": 119704,
+   "pct_now": 17.85,
+   "pct_inplace": 98.2
+  },
+  {
+   "pair": "req-00043.json->req-00044.json",
+   "sha256_16": "ec4c5de70fe2470a",
+   "tokens_now": 121947,
+   "tokens_inplace": 122055,
+   "common_now": 121786,
+   "common_inplace": 121872,
+   "pct_now": 99.87,
+   "pct_inplace": 99.85
+  },
+  {
+   "pair": "req-00044.json->req-00045.json",
+   "sha256_16": "2a68673f6fa00342",
+   "tokens_now": 122198,
+   "tokens_inplace": 122314,
+   "common_now": 21756,
+   "common_inplace": 121872,
+   "pct_now": 17.8,
+   "pct_inplace": 99.64
+  },
+  {
+   "pair": "req-00045.json->req-00046.json",
+   "sha256_16": "6da849ed4f891892",
+   "tokens_now": 122353,
+   "tokens_inplace": 122465,
+   "common_now": 122194,
+   "common_inplace": 122284,
+   "pct_now": 99.87,
+   "pct_inplace": 99.85
+  },
+  {
+   "pair": "req-00046.json->req-00047.json",
+   "sha256_16": "ab84ddd8a0a4c5b2",
+   "tokens_now": 126172,
+   "tokens_inplace": 126292,
+   "common_now": 21775,
+   "common_inplace": 122284,
+   "pct_now": 17.26,
+   "pct_inplace": 96.83
+  },
+  {
+   "pair": "req-00047.json->req-00048.json",
+   "sha256_16": "23570e841fd9e8d0",
+   "tokens_now": 126327,
+   "tokens_inplace": 126443,
+   "common_now": 126168,
+   "common_inplace": 126262,
+   "pct_now": 99.87,
+   "pct_inplace": 99.86
+  },
+  {
+   "pair": "req-00048.json->req-00049.json",
+   "sha256_16": "00c0308a907036c9",
+   "tokens_now": 127562,
+   "tokens_inplace": 127686,
+   "common_now": 21794,
+   "common_inplace": 126262,
+   "pct_now": 17.09,
+   "pct_inplace": 98.88
+  },
+  {
+   "pair": "req-00049.json->req-00050.json",
+   "sha256_16": "d693204122826b12",
+   "tokens_now": 127717,
+   "tokens_inplace": 127837,
+   "common_now": 127558,
+   "common_inplace": 127656,
+   "pct_now": 99.88,
+   "pct_inplace": 99.86
+  },
+  {
+   "pair": "req-00050.json->req-00051.json",
+   "sha256_16": "1e49156556427eb6",
+   "tokens_now": 129779,
+   "tokens_inplace": 129907,
+   "common_now": 21813,
+   "common_inplace": 127656,
+   "pct_now": 16.81,
+   "pct_inplace": 98.27
+  },
+  {
+   "pair": "req-00051.json->req-00052.json",
+   "sha256_16": "e1a5c1c033799b0a",
+   "tokens_now": 129941,
+   "tokens_inplace": 130065,
+   "common_now": 129775,
+   "common_inplace": 129877,
+   "pct_now": 99.87,
+   "pct_inplace": 99.86
+  },
+  {
+   "pair": "req-00052.json->req-00053.json",
+   "sha256_16": "a51d46c3c4090c96",
+   "tokens_now": 131838,
+   "tokens_inplace": 131970,
+   "common_now": 21832,
+   "common_inplace": 129877,
+   "pct_now": 16.56,
+   "pct_inplace": 98.41
+  },
+  {
+   "pair": "req-00053.json->req-00054.json",
+   "sha256_16": "716564df7e55b3d0",
+   "tokens_now": 131995,
+   "tokens_inplace": 132123,
+   "common_now": 131834,
+   "common_inplace": 131940,
+   "pct_now": 99.88,
+   "pct_inplace": 99.86
+  },
+  {
+   "pair": "req-00054.json->req-00055.json",
+   "sha256_16": "28c13486d00b4881",
+   "tokens_now": 135312,
+   "tokens_inplace": 135448,
+   "common_now": 21851,
+   "common_inplace": 131940,
+   "pct_now": 16.15,
+   "pct_inplace": 97.41
+  },
+  {
+   "pair": "req-00055.json->req-00056.json",
+   "sha256_16": "f4e9973c60187e3a",
+   "tokens_now": 135477,
+   "tokens_inplace": 135609,
+   "common_now": 135308,
+   "common_inplace": 135418,
+   "pct_now": 99.88,
+   "pct_inplace": 99.86
+  },
+  {
+   "pair": "req-00056.json->req-00057.json",
+   "sha256_16": "fc82e4dc3d80516c",
+   "tokens_now": 84588,
+   "tokens_inplace": 84596,
+   "common_now": 9731,
+   "common_inplace": 9731,
+   "pct_now": 11.5,
+   "pct_inplace": 11.5
+  },
+  {
+   "pair": "req-00057.json->req-00058.json",
+   "sha256_16": "ddb34964ab60a317",
+   "tokens_now": 85710,
+   "tokens_inplace": 85722,
+   "common_now": 35156,
+   "common_inplace": 84596,
+   "pct_now": 41.02,
+   "pct_inplace": 98.69
+  },
+  {
+   "pair": "req-00058.json->req-00059.json",
+   "sha256_16": "d1db53d316696cca",
+   "tokens_now": 94087,
+   "tokens_inplace": 94103,
+   "common_now": 35260,
+   "common_inplace": 85610,
+   "pct_now": 37.48,
+   "pct_inplace": 90.97
+  },
+  {
+   "pair": "req-00059.json->req-00060.json",
+   "sha256_16": "6d65655ccb691ede",
+   "tokens_now": 95451,
+   "tokens_inplace": 95471,
+   "common_now": 35279,
+   "common_inplace": 94076,
+   "pct_now": 36.96,
+   "pct_inplace": 98.54
+  },
+  {
+   "pair": "req-00060.json->req-00061.json",
+   "sha256_16": "5f1164663dd4a717",
+   "tokens_now": 97222,
+   "tokens_inplace": 97238,
+   "common_now": 95451,
+   "common_inplace": 95444,
+   "pct_now": 98.18,
+   "pct_inplace": 98.16
+  }
+ ]
+}
