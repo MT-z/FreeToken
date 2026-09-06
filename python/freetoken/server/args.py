@@ -30,6 +30,10 @@ class ServerArgs(SchedulerConfig):
     # "model": fill unspecified request sampling params from generation_config.json
     # (temperature/top_k/top_p), like sglang. "none": use framework defaults only.
     sampling_defaults: str = "model"
+    # Where this serve writes its pidfile (--pidfile), gunicorn-style. Defaults to
+    # $XDG_RUNTIME_DIR/freetoken/serve-<port>.pid so a supervisor -- or the operator --
+    # can always name the process without having remembered a flag. "" disables it.
+    pidfile: str | None = None
     # Per-key overrides layered on top of whatever --sampling-defaults resolved. A
     # generation_config.json carries ONE recommendation, but a model card often gives several
     # (Ornith-1.5: temperature 1.0 general, 0.6 for precise coding) -- and a client that sends
@@ -443,6 +447,28 @@ def parse_args(
             "usage.cache_read_input_tokens, Responses usage.input_tokens_details.cached_tokens). "
             "On /v1/messages this also makes input_tokens EXCLUDE the cached prefix, matching "
             "Anthropic billing semantics."
+        ),
+    )
+
+    parser.add_argument(
+        "--pidfile",
+        dest="pidfile",
+        default=ServerArgs.pidfile,
+        metavar="PATH",
+        help=(
+            "Write this serve's pid to PATH, the way gunicorn does: a serve started "
+            "against a file whose pid is still alive refuses to start, and one whose pid "
+            "is gone takes the file over. A supervisor can then name the process it is "
+            "watching without parsing `ss` output. The check is kill(pid, 0), so a crash "
+            "never wedges the restart and nothing depends on how the serve exited. "
+            "Defaults to $XDG_RUNTIME_DIR/freetoken/serve-<port>.pid, then "
+            "the platform temp dir, then ./.freetoken/ -- the first of those this serve "
+            "can write, so the file is there without having remembered a flag; pass an "
+            "empty string to disable it. "
+            "Named for the setting the ecosystem shares -- puma and uWSGI spell the flag "
+            "itself `pidfile`, and it is gunicorn's internal name for `--pid` too. This "
+            "is for hosts that run more than one serve; in a one-process container the "
+            "pid is always 1 and an orchestrator wants a readiness probe, not this."
         ),
     )
 

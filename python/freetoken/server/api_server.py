@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import signal
+import tempfile
 import threading
 import time
 import uuid
@@ -449,6 +450,86 @@ _TRACKED_REQUEST_PREFIXES = (
 # enters generation accounting, and its first-touch tokenizer load would otherwise dominate the
 # /v1/stats p95 and pollute /v1/requests — exclude it before the prefix check below.
 _UNTRACKED_REQUEST_PREFIXES = ("/v1/messages/count_tokens",)
+
+
+@contextlib.contextmanager
+def _pidfile(path: str):
+    """gunicorn's pidfile contract, which is the one people expect to argue with.
+
+    ``kill(pid, 0)`` on whatever the file already holds: alive means another serve owns
+    this deployment and we refuse to start; ESRCH means the file is stale and ours to
+    take; EPERM means alive but owned by another user, which still counts as alive.
+    gunicorn returns early when the recorded pid is its own -- its master re-creates the
+    file across a reload -- but nothing here re-enters, so the same pid means this path
+    was taken twice, which is a bug worth surfacing rather than waving through.
+
+    The write is ``mkstemp`` + ``os.replace`` so a reader never sees a half-written pid,
+    and the unlink on exit happens only when the file still holds our pid, so a serve
+    that was replaced does not delete its successor's file.
+    """
+    old = _pid_in(path)
+    if old is not None:
+        raise RuntimeError(f"already running on pid {old} (or {path} is stale)")
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d)
+    try:
+        os.write(fd, f"{os.getpid()}\n".encode())
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    os.chmod(path, 0o644)
+    try:
+        yield path
+    finally:
+        if _pid_in(path) == os.getpid():
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+
+
+def _pid_in(path: str) -> int | None:
+    """The live pid recorded in ``path``; None when the file is absent, unreadable, not a
+    number, or names a process that is gone."""
+    try:
+        with open(path) as fh:
+            pid = int(fh.read().strip() or 0)
+    except (OSError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:      # ESRCH -- stale
+        return None
+    except PermissionError:         # EPERM -- alive, someone else's
+        return pid
+    except OSError:
+        return None
+    return pid
+
+
+def _default_pidfile(port: int) -> str:
+    """``<runtime dir>/freetoken/serve-<port>.pid``, falling back to the working directory.
+
+    ``tempfile.gettempdir()`` is the OS question already answered by the standard library:
+    it reads TMPDIR/TEMP/TMP and the platform's own default, so there is no per-OS branch
+    here to get wrong. It can still be somewhere this serve may not write -- a read-only
+    or distroless rootfs, ``PrivateTmp=yes``, a locked-down container -- and the answer
+    then is the directory the operator started the serve in, which by definition exists.
+
+    All three are host paths. In a one-process container the file still appears, but its
+    pid is 1 and says nothing an orchestrator can use -- that case wants a readiness
+    probe on the serve itself, which is a different piece of work.
+    """
+    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    for d in (os.path.join(base, "freetoken"), os.path.join(os.getcwd(), ".freetoken")):
+        try:
+            os.makedirs(d, exist_ok=True)
+            if os.access(d, os.W_OK):
+                return os.path.join(d, f"serve-{port}.pid")
+        except OSError:
+            continue
+    return ""
 
 
 def _served_model_name() -> str | None:
@@ -1060,8 +1141,29 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         daemon=True,
     ).start()
 
-    if run_shell:
-        _serve_and_run_shell(host, port)
-        return
-    # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
-    uvicorn.run(app, host=host, port=port)
+    # A pidfile the way gunicorn writes one (see _pidfile). On by default: a flag you have
+    # to remember is missing exactly when something has gone wrong. "" disables it.
+    pidfile_path = getattr(config, "pidfile", None)
+    if pidfile_path is None:
+        pidfile_path = _default_pidfile(port)
+    stack = contextlib.ExitStack()
+    if pidfile_path:
+        try:
+            stack.enter_context(_pidfile(pidfile_path))
+        except RuntimeError as exc:
+            logger.error("%s", exc)
+            raise SystemExit(1) from exc
+        except OSError as exc:
+            # An unwritable path must never stop a serve that would otherwise run.
+            logger.warning("pidfile: %s not written (%s)", pidfile_path, exc)
+            pidfile_path = ""
+        else:
+            logger.info("pidfile: wrote %d to %s", os.getpid(), pidfile_path)
+
+    with stack:
+        if run_shell:
+            _serve_and_run_shell(host, port)
+            return
+        # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the
+        # worker group.
+        uvicorn.run(app, host=host, port=port)

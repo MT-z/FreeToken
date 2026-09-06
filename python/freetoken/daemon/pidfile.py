@@ -32,8 +32,14 @@ class SingleInstance:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
+            # Name the holder, not the caller: `ft serve --pidfile` uses this too, and a
+            # supervisor reading the error wants the pid it is competing with.
+            try:
+                held = os.read(fd, 32).decode().strip() or "?"
+            except OSError:  # pragma: no cover -- unreadable fd, report without the pid
+                held = "?"
             os.close(fd)
-            raise AlreadyRunning(f"another ft daemon holds {self.path}") from exc
+            raise AlreadyRunning(f"{self.path} is held by pid {held}") from exc
         os.ftruncate(fd, 0)
         os.write(fd, f"{os.getpid()}\n".encode())
         os.fsync(fd)

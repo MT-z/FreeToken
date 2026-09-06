@@ -227,3 +227,5 @@ benchmarks/cross_framework
 
 # local e2e/bench artifacts (harnesses may run with repo cwd)
 /results/
+# ft serve's pidfile, when neither XDG_RUNTIME_DIR nor the temp dir is writable
+.freetoken/
