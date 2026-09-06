@@ -11,16 +11,27 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _PY = os.path.join(_ROOT, "python")
 if _PY not in sys.path:
     sys.path.insert(0, _PY)
 
-from freetoken.server import anthropic_api as A  # noqa: E402
-from freetoken.server import api_server  # noqa: E402
-from freetoken.server.args import ServerArgs, parse_args  # noqa: E402
+from freetoken.server import anthropic_api as A
+from freetoken.server import api_server
+from freetoken.server.args import ServerArgs, parse_args
 
 ENV = "FREETOKEN_SYSTEM_IN_PLACE"
+
+
+@pytest.fixture(autouse=True)
+def _unconfigured_placement(monkeypatch):
+    # Every test here starts and ends with the adapter unconfigured (environment only),
+    # whatever a failing assertion leaves behind.
+    monkeypatch.setattr(A, "_SYSTEM_IN_PLACE", None)
+    yield
+    A._SYSTEM_IN_PLACE = None
 
 
 class _Config:
@@ -60,7 +71,6 @@ def test_serve_resolves_flag_and_environment_as_either_may_turn_it_off(monkeypat
 def test_configured_placement_wins_over_the_environment(monkeypatch):
     # Once the serve has configured the adapter, the environment no longer matters;
     # unconfigured (tests, offline tools) it falls back to the environment.
-    monkeypatch.setattr(A, "_SYSTEM_IN_PLACE", None)
     monkeypatch.setenv(ENV, "0")
     assert A._system_in_place() is False
     monkeypatch.setattr(A, "_SYSTEM_IN_PLACE", True)
@@ -70,4 +80,25 @@ def test_configured_placement_wins_over_the_environment(monkeypatch):
     assert A._system_in_place() is False
     A.configure_system_placement(True)
     assert A._system_in_place() is True
-    monkeypatch.setattr(A, "_SYSTEM_IN_PLACE", None)  # leave the module as found
+
+
+@pytest.mark.parametrize(
+    ("flag", "env", "in_place", "phrase"),
+    [
+        (True, None, True, "system messages: in place"),
+        (False, None, False, "system messages: hoisted into the head system block"),
+        (True, "0", False, "system messages: hoisted into the head system block"),
+    ],
+)
+def test_serve_declares_the_placement_in_one_log_line(monkeypatch, flag, env, in_place, phrase):
+    # D7: the log line is the only way to tell the two prompt shapes apart after the fact,
+    # so its wording is pinned, and it names both ways to turn the placement off.
+    monkeypatch.delenv(ENV, raising=False)
+    if env is not None:
+        monkeypatch.setenv(ENV, env)
+    lines: list[str] = []
+    monkeypatch.setattr(api_server.logger, "info", lambda fmt, *args: lines.append(fmt % args))
+    assert api_server._declare_system_placement(SimpleNamespace(system_in_place=flag)) is in_place
+    assert A._system_in_place() is in_place  # the adapter was configured, not just logged
+    assert len(lines) == 1 and lines[0].startswith(phrase)
+    assert "--no-system-in-place" in lines[0] and "FREETOKEN_SYSTEM_IN_PLACE=0" in lines[0]

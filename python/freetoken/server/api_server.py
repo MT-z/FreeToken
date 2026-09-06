@@ -1136,6 +1136,27 @@ def _system_placement(config: ServerArgs) -> bool:
     return bool(getattr(config, "system_in_place", True)) and system_in_place_env()
 
 
+_SYSTEM_PLACEMENT_LINES = {
+    True: "system messages: in place (mid-conversation system-role messages become user turns; "
+    "--no-system-in-place or FREETOKEN_SYSTEM_IN_PLACE=0 hoists them)",
+    False: "system messages: hoisted into the head system block "
+    "(--no-system-in-place / FREETOKEN_SYSTEM_IN_PLACE=0)",
+}
+
+
+def _declare_system_placement(config: ServerArgs) -> bool:
+    """Resolve where /v1/messages puts mid-conversation system-role messages, fix it for
+    the process, and say so in the log. Declared at start-up because nothing else in the
+    logs tells the two prompt shapes apart, and the prefix cache differs 6x between them
+    (.claude/DESIGN-system-in-place.md)."""
+    from .anthropic_api import configure_system_placement
+
+    in_place = _system_placement(config)
+    configure_system_placement(in_place)
+    logger.info("%s", _SYSTEM_PLACEMENT_LINES[in_place])
+    return in_place
+
+
 def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_shell: bool) -> None:
     """
     Run the frontend API server (FastAPI + uvicorn) and wire it to the tokenizer process via ZMQ.
@@ -1174,20 +1195,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _MODEL_SAMPLING.get("presence_penalty", 0.0),
     )
 
-    # /v1/messages: where mid-conversation system-role messages go. Declared at start-up
-    # because nothing else in the logs tells the two prompt shapes apart, and the prefix
-    # cache differs 6x between them (.claude/DESIGN-system-in-place.md).
-    from .anthropic_api import configure_system_placement
-
-    in_place = _system_placement(config)
-    configure_system_placement(in_place)
-    logger.info(
-        "system messages: %s",
-        "in place (mid-conversation system-role messages become user turns; "
-        "--no-system-in-place or FREETOKEN_SYSTEM_IN_PLACE=0 hoists them)"
-        if in_place
-        else "hoisted into the head system block (--no-system-in-place / FREETOKEN_SYSTEM_IN_PLACE=0)",
-    )
+    _declare_system_placement(config)
     if run_shell:
         assert not config.use_dummy_weight, "Shell mode does not support dummy weights."
 

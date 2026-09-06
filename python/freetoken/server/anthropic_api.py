@@ -376,9 +376,10 @@ _SYSTEM_IN_PLACE: bool | None = None  # set once by the serve from its arguments
 
 
 def configure_system_placement(in_place: bool) -> None:
-    """Fix the placement for this process (the serve calls it after parsing arguments, so
-    --no-system-in-place wins over the environment). Tests and offline tools that never
-    call it fall back to FREETOKEN_SYSTEM_IN_PLACE."""
+    """Fix the placement for this process. The serve calls it once with the AND of its
+    flag and the environment (api_server._system_placement): either --no-system-in-place
+    or FREETOKEN_SYSTEM_IN_PLACE=0 turns it off, and nothing turns it back on for that
+    process. Tests and offline tools that never call it fall back to the environment."""
     global _SYSTEM_IN_PLACE
     _SYSTEM_IN_PLACE = bool(in_place)
 
@@ -391,8 +392,9 @@ def system_in_place_env() -> bool:
 def _system_in_place() -> bool:
     """Default on (stage 4 of the design): system-role messages that follow the first
     non-system message stay where they are, as user turns; off hoists them into the head
-    system block as before. Configured by the serve, else by the environment; read per
-    call so one process can compare both."""
+    system block as before. Fixed for the process once the serve has called
+    configure_system_placement; until then (tests, offline tools) the environment is read
+    on every call, so such a process can render both shapes by toggling the variable."""
     if _SYSTEM_IN_PLACE is not None:
         return _SYSTEM_IN_PLACE
     return system_in_place_env()
