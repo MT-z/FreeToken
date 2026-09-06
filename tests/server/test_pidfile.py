@@ -13,7 +13,6 @@ import signal
 import subprocess
 
 import pytest
-
 from freetoken.server.api_server import (
     _install_stop_signal_handlers,
     _pid_in,
