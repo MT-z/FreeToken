@@ -4,7 +4,6 @@ import asyncio
 import atexit
 import contextlib
 import json
-import itertools
 import os
 import signal
 import tempfile
@@ -575,64 +574,36 @@ def _served_model_name() -> str | None:
     return getattr(cfg, "served_model_name", None)
 
 
-# Wire log: set FREETOKEN_WIRE_LOG=<path> to record every request and response -- method,
-# query, headers, bodies and timing -- into that file. Unset (the default) the middleware
-# returns on its first line, so a server without the variable behaves exactly as before.
-_WIRE_LOG_PATH = os.environ.get("FREETOKEN_WIRE_LOG")
-_WIRE_BODY_CAP = int(os.environ.get("FREETOKEN_WIRE_BODY_CAP", "4096"))
-_WIRE_SKIP_HEADERS = {"authorization", "x-api-key", "cookie", "anthropic-auth-token"}
-# FREETOKEN_WIRE_BODY_DIR=<dir> additionally drops each full request body into
-# <dir>/req-<NNNNN>.json. The log line stays capped; this is for byte-exact diffing of
-# consecutive requests, which a capped line cannot answer.
-_WIRE_BODY_DIR = os.environ.get("FREETOKEN_WIRE_BODY_DIR")
-_WIRE_SEQ = itertools.count(1)
-
-
-def _wire(line: str) -> None:
-    try:
-        with open(_WIRE_LOG_PATH, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-    except Exception:  # noqa: BLE001 -- a broken log must never affect the request
-        pass
-
-
-def _wire_headers(items) -> str:
-    return " ".join(
-        f"{k}={v}" for k, v in items if k.lower() not in _WIRE_SKIP_HEADERS
-    )
+# Wire log (diagnostic, off unless FREETOKEN_WIRE_LOG is set): see wire_log.py. The
+# middleware only formats and enqueues; a writer thread owns the disk.
+from .wire_log import BODY_CAP as _WIRE_BODY_CAP, WIRE as _WIRE, headers_line as _wire_headers, stamp as _wire_stamp
 
 
 @app.middleware("http")
 async def _wire_log_middleware(request: Request, call_next):
-    if not _WIRE_LOG_PATH:
+    if not _WIRE.enabled():
         return await call_next(request)
     import time as _time
 
-    stamp = _time.strftime("%H:%M:%S", _time.localtime()) + f".{int(_time.time() * 1000) % 1000:03d}"
+    stamp = _wire_stamp()
     peer = f"{request.client.host}:{request.client.port}" if request.client else "-"
     target = request.url.path + (f"?{request.url.query}" if request.url.query else "")
     # Reading here caches the bytes on the Request, so the route handler still sees them.
     raw = await request.body()
-    _wire(f"[{stamp}] >>> {peer} {request.method} {target}")
-    _wire(f"[{stamp}]     req-headers {_wire_headers(request.headers.items())}")
+    _WIRE.line(f"[{stamp}] >>> {peer} {request.method} {target}")
+    _WIRE.line(f"[{stamp}]     req-headers {_wire_headers(request.headers.items())}")
     if raw:
-        _wire(f"[{stamp}]     req-body[{len(raw)}] {raw[:_WIRE_BODY_CAP].decode('utf-8', 'replace')}")
-        if _WIRE_BODY_DIR:
-            try:
-                os.makedirs(_WIRE_BODY_DIR, exist_ok=True)
-                name = os.path.join(_WIRE_BODY_DIR, f"req-{next(_WIRE_SEQ):05d}.json")
-                with open(name, "wb") as fh:
-                    fh.write(raw)
-                _wire(f"[{stamp}]     req-body-file {name}")
-            except Exception:  # noqa: BLE001 -- a broken dump must never affect the request
-                pass
+        _WIRE.line(f"[{stamp}]     req-body[{len(raw)}] {raw[:_WIRE_BODY_CAP].decode('utf-8', 'replace')}")
+        name = _WIRE.body(raw)
+        if name:
+            _WIRE.line(f"[{stamp}]     req-body-file {name}")
 
     start = _time.monotonic()
     response = await call_next(request)
     ms = int((_time.monotonic() - start) * 1000)
-    stamp2 = _time.strftime("%H:%M:%S", _time.localtime()) + f".{int(_time.time() * 1000) % 1000:03d}"
-    _wire(f"[{stamp2}] <<< {peer} {response.status_code} {target} ({ms} ms)")
-    _wire(f"[{stamp2}]     res-headers {_wire_headers(response.headers.items())}")
+    stamp2 = _wire_stamp()
+    _WIRE.line(f"[{stamp2}] <<< {peer} {response.status_code} {target} ({ms} ms)")
+    _WIRE.line(f"[{stamp2}]     res-headers {_wire_headers(response.headers.items())}")
 
     body_iter = getattr(response, "body_iterator", None)
     if body_iter is None:
@@ -645,10 +616,10 @@ async def _wire_log_middleware(request: Request, call_next):
         async for chunk in body_iter:
             if seen < _WIRE_BODY_CAP:
                 text = bytes(chunk)[: _WIRE_BODY_CAP - seen].decode("utf-8", "replace")
-                _wire(f"[{_time.strftime('%H:%M:%S', _time.localtime())}]     res-chunk {text!r}")
+                _WIRE.line(f"[{_wire_stamp()}]     res-chunk {text!r}")
             seen += len(chunk)
             yield chunk
-        _wire(f"[{_time.strftime('%H:%M:%S', _time.localtime())}]     res-end[{seen}] {target}")
+        _WIRE.line(f"[{_wire_stamp()}]     res-end[{seen}] {target}")
 
     response.body_iterator = _tee()
     return response
