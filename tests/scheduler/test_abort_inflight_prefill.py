@@ -94,10 +94,17 @@ def _launch_req(pool, cm, tm, prompt, *, cls=Req, track_seqlen=None):
 
 
 def _as_last_data(batch):
+    # ForwardOutput itself, not a bare 3-tuple: it grew optional logprobs fields, so the
+    # scheduler reads it by name and a positional stub no longer stands in for it.
+    from freetoken.engine.engine import ForwardOutput
+
     return (
         SimpleNamespace(batch=batch),
-        (None, torch.tensor([42], dtype=torch.int32),
-         SimpleNamespace(synchronize=lambda: None)),
+        ForwardOutput(
+            None,
+            torch.tensor([42], dtype=torch.int32),
+            SimpleNamespace(synchronize=lambda: None),
+        ),
     )
 
 
