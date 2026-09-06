@@ -201,6 +201,18 @@ class ImageInputUnsupported(ValueError):
     /v1/messages/count_tokens has no per-request isolation to fall back on: without this
     distinction an agent client asking to count an image-bearing turn got a 500."""
 
+def _map_developer_role(
+    messages: list[dict[str, Any]], chat_template: str | None
+) -> list[dict[str, Any]]:
+    """OpenAI's ``developer`` role is the current spelling of ``system`` (clients such as pi
+    send the system prompt that way by default). Most chat templates do not know it and raise
+    ("Unexpected message role"), so map it to ``system`` unless the template handles it."""
+    if "developer" in (chat_template or "") or not any(
+        m.get("role") == "developer" for m in messages
+    ):
+        return messages
+    return [{**m, "role": "system"} if m.get("role") == "developer" else m for m in messages]
+
 
 class TokenizeManager:
     def __init__(
@@ -389,6 +401,8 @@ class TokenizeManager:
         continue_final = bool(chat_template_kwargs.pop("continue_final_message", False))
         if continue_final:
             chat_template_kwargs["continue_final_message"] = True
+
+        messages = _map_developer_role(messages, getattr(self.tokenizer, "chat_template", None))
         prompt = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
