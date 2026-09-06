@@ -409,12 +409,15 @@ async def lifespan(_: FastAPI):
     # exit as expected rather than a crash — no spurious ERROR / "failed" latch during stop.
     _SHUTTING_DOWN.set()
     global _GLOBAL_STATE
-    if _GLOBAL_STATE is not None:
-        _GLOBAL_STATE.shutdown()
-    # The wire log's atexit hook never runs when the process dies by SIGTERM (the pidfile
-    # learned the same lesson, see _install_pidfile_release_handlers); this hook does, so
-    # close it here and let atexit stay as the backstop for the other exits.
-    _WIRE.close()
+    try:
+        if _GLOBAL_STATE is not None:
+            _GLOBAL_STATE.shutdown()
+    finally:
+        # The wire log's atexit hook never runs when the process dies by SIGTERM (the
+        # pidfile learned the same lesson, see _install_pidfile_release_handlers); this
+        # hook does, so close it here -- even when the state's own teardown raises --
+        # and let atexit stay as the backstop for the other exits.
+        _WIRE.close()
 
 
 def install_cors(app: FastAPI, origins_csv: str) -> None:

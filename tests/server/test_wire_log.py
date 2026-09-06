@@ -150,3 +150,28 @@ def test_the_apps_shutdown_hook_closes_the_log_so_a_sigterm_stop_keeps_its_recor
     assert lines[-1].startswith("wire: ") and "1 bodies written" in lines[-1] and lines[-1].endswith("0 dropped, 0 failed")
     bodies = [f for _, _, fs in os.walk(tmp_path / "bodies") for f in fs]
     assert bodies == ["req-00001.json"]
+
+
+def test_the_shutdown_hook_closes_the_log_even_when_the_states_teardown_raises(tmp_path, monkeypatch):
+    # shutdown() stops the tokenizer sockets and terminates workers; if it raises, the log
+    # must still be closed, or the fix above silently comes undone on exactly that exit.
+    import threading
+    from types import SimpleNamespace
+
+    import pytest
+    from fastapi.testclient import TestClient
+    from freetoken.server import api_server
+
+    def boom():
+        raise RuntimeError("teardown failed")
+
+    w = _log(tmp_path)
+    monkeypatch.setattr(api_server, "_WIRE", w)
+    monkeypatch.setattr(api_server, "_GLOBAL_STATE", SimpleNamespace(shutdown=boom))
+    monkeypatch.setattr(api_server, "_SHUTTING_DOWN", threading.Event())
+    with pytest.raises(RuntimeError, match="teardown failed"):
+        with TestClient(api_server.app) as client:
+            client.post("/nowhere", json={"model": "x"})
+    assert w._worker is None
+    lines = (tmp_path / "wire.log").read_text(encoding="utf-8").splitlines()
+    assert lines[-1].startswith("wire: ") and "1 bodies written" in lines[-1]
