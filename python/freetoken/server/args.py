@@ -696,6 +696,18 @@ def parse_args(
         default=ServerArgs.disk_fetch_workers,
         help="Disk-tier O_DIRECT fetch threads (default 8).",
     )
+    parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Log MoE expert-cache miss rate and routing skew during decode. The counters "
+            "are captured into the decode CUDA graph, so this can only be chosen at startup. "
+            "Measured cost is below noise (46.1 vs 45.8 tok/s median on Ornith-35B-A3B "
+            "IQ3_S), but it stays off by default since it is a diagnostic and the readout "
+            "costs a host sync."
+        ),
+    )
 
     parser.add_argument(
         "--moe-cpu-threads",
