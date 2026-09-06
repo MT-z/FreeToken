@@ -30,9 +30,6 @@ class ServerArgs(SchedulerConfig):
     # "model": fill unspecified request sampling params from generation_config.json
     # (temperature/top_k/top_p), like sglang. "none": use framework defaults only.
     sampling_defaults: str = "model"
-    # Build and load the checkpoint's vision tower (--vision). Off by default: it is ~0.8 GiB
-    # of resident bf16 that text-only serving never reads.
-    vision: bool = False
     # Per-key overrides layered on top of whatever --sampling-defaults resolved. A
     # generation_config.json carries ONE recommendation, but a model card often gives several
     # (Ornith-1.5: temperature 1.0 general, 0.6 for precise coding) -- and a client that sends
@@ -459,19 +456,6 @@ def parse_args(
             "temperature/top_k/top_p from the checkpoint's generation_config.json "
             "(recommended for reasoning models to avoid greedy repetition loops); "
             "'none' uses framework defaults only."
-        ),
-    )
-
-    parser.add_argument(
-        "--vision",
-        action="store_true",
-        dest="vision",
-        default=ServerArgs.vision,
-        help=(
-            "Build and load the checkpoint's vision tower so the API accepts images. Off by "
-            "default: it is ~0.8 GiB of resident bf16 weights that text-only serving never "
-            "reads. The tower also comes out of the KV budget, so pair it with "
-            "--kv-reserve-tokens if the deployment serves long prompts."
         ),
     )
 

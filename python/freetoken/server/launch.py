@@ -46,20 +46,12 @@ def _detach_process_group() -> None:
         pass
 
 
-def _run_tokenize_worker(detach: bool, vision: bool = False, **kwargs) -> None:
+def _run_tokenize_worker(detach: bool, **kwargs) -> None:
     """Module-level so it survives the spawn pickle; exists only to detach the group first."""
     if detach:
         _detach_process_group()
-    # A third process, and the gate is process-local: the scheduler's and the API's calls do
-    # not reach here. This worker decides whether to load an image processor at all, from the
-    # same is_multimodal that --vision drives.
-    from freetoken.models.config import set_vision_enabled
-
-    # Pin only when asked: pinning False on a bare launch would defeat
-    # FREETOKEN_LOAD_VISION=1, the gate the rest of the engine documents.
-    if vision:
-        set_vision_enabled(True)
-
+    # The gate is FREETOKEN_LOAD_VISION, read per process from the environment this worker
+    # inherits through the spawn -- nothing to thread in.
     from freetoken.tokenizer import tokenize_worker
 
     tokenize_worker(**kwargs)
@@ -75,13 +67,6 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     # resolved UUIDs when we have them, the raw --gpu entries when NVML could not resolve them, else one CUDA ordinal per rank
     targets = args.gpu_assigned or args.gpu or tuple(str(r) for r in range(args.tp_info.size))
     set_assigned_gpu(targets[args.tp_info.rank])
-
-    # Before anything imports a model: the weight loader and every parse_config read this gate,
-    # and this process -- not the API process -- is the one that builds the model.
-    from freetoken.models.config import set_vision_enabled
-
-    if args.vision:
-        set_vision_enabled(True)
 
     import torch
     from freetoken.scheduler import Scheduler
@@ -195,7 +180,6 @@ def launch_server(
             target=_run_tokenize_worker,
             kwargs={
                 "detach": detach,
-                "vision": server_args.vision,
                 "tokenizer_path": server_args.model_path,
                 "addr": server_args.zmq_detokenizer_addr,
                 "backend_addr": server_args.zmq_backend_addr,
