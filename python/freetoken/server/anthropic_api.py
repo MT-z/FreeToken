@@ -11,6 +11,7 @@ It consumes typed events, not a re-parsed OpenAI stream.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -200,9 +201,15 @@ def convert_anthropic_prompt(
     """(messages, template_tools, parser_tools, chat_template_kwargs) — the prompt
     side of the conversion, shared by /v1/messages and /v1/messages/count_tokens so
     a counted prompt is exactly the prompt a generation would tokenize."""
-    # Collect all system content (top-level `system` + any system-role messages
-    # Claude Code interleaves in the array) and emit ONE system message at the
+    # Collect the leading system content (top-level `system` + any system-role
+    # messages before the first non-system one) and emit ONE system message at the
     # front: strict chat templates (e.g. Qwen3.5) require system at the beginning.
+    # System-role messages Claude Code interleaves later in the array
+    # (<system-reminder>s) are hoisted into that block by default. With
+    # FREETOKEN_SYSTEM_IN_PLACE=1 each run of them stays where it was, as ONE user
+    # turn, so the prompt's head stops moving and the radix cache can match the
+    # previous turn (see .claude/DESIGN-system-in-place.md).
+    in_place = _system_in_place()
     system_texts: list[str] = []
     if req.system:
         if isinstance(req.system, str):
@@ -213,10 +220,24 @@ def convert_anthropic_prompt(
             )
 
     other: list[dict[str, Any]] = []
+    seen_non_system = False
+    pending_reminders: list[str] = []  # a run of in-place system texts -> one user turn
+
+    def _flush_reminders() -> None:
+        text = "\n\n".join(t for t in pending_reminders if t)
+        pending_reminders.clear()
+        if text:
+            other.append({"role": "user", "content": text})
+
     for msg in req.messages:
         if msg.role == "system":
-            system_texts.append(_content_text(msg.content))
+            if in_place and seen_non_system:
+                pending_reminders.append(_content_text(msg.content))
+            else:
+                system_texts.append(_content_text(msg.content))
             continue
+        seen_non_system = True
+        _flush_reminders()
 
         if isinstance(msg.content, str):
             other.append({"role": msg.role, "content": msg.content})
@@ -282,6 +303,7 @@ def convert_anthropic_prompt(
             # Nothing usable in this message (e.g. image-only) — skip it.
             continue
         other.append(openai_msg)
+    _flush_reminders()  # a trailing run (the turn's own <system-reminder>) is the last user turn
 
     messages: list[dict[str, Any]] = []
     system_text = "\n\n".join(t for t in system_texts if t)
@@ -346,6 +368,16 @@ def convert_anthropic_to_genspec(
         template_tools=template_tools,
         parser_tools=parser_tools,
     )
+
+
+_SYSTEM_IN_PLACE_ENV = "FREETOKEN_SYSTEM_IN_PLACE"
+
+
+def _system_in_place() -> bool:
+    """Stage-1 switch, default off: keep system-role messages that follow the first
+    non-system message where they are (as user turns) instead of hoisting them into
+    the head system block. Read per call so one process can compare both."""
+    return os.environ.get(_SYSTEM_IN_PLACE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _content_text(content) -> str:

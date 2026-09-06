@@ -251,6 +251,147 @@ def test_convert_hoists_and_merges_system_messages():
     assert "mid-stream sys" in spec.messages[0]["content"]
 
 
+# --- FREETOKEN_SYSTEM_IN_PLACE (stage 1 of .claude/DESIGN-system-in-place.md) ---------- #
+# Default off: the hoist above stays. On: system-role messages after the first
+# non-system one stay where they were, as user turns, so the prompt head stops moving.
+
+_IN_PLACE_ENV = "FREETOKEN_SYSTEM_IN_PLACE"
+
+
+def _roles(spec) -> list[str]:
+    return [m["role"] for m in spec.messages]
+
+
+def _hoist_fixture() -> AnthropicMessagesRequest:
+    # The same body as test_convert_hoists_and_merges_system_messages.
+    return AnthropicMessagesRequest.model_validate(
+        {
+            "model": "claude-x",
+            "max_tokens": 64,
+            "system": "top-level sys",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "system", "content": "mid-stream sys"},
+                {"role": "assistant", "content": "hi"},
+            ],
+        }
+    )
+
+
+def test_convert_system_in_place_default_is_off(monkeypatch):
+    monkeypatch.delenv(_IN_PLACE_ENV, raising=False)
+    spec = A.convert_anthropic_to_genspec(_hoist_fixture(), {})
+    assert _roles(spec) == ["system", "user", "assistant"]
+    assert "mid-stream sys" in spec.messages[0]["content"]  # still hoisted
+
+
+def test_convert_system_in_place_keeps_mid_system_as_its_own_user_turn(monkeypatch):
+    # D1 `own`: the mid-stream system becomes a user turn at its own position; the head
+    # block holds only the top-level system. (Measured role list of the :231 fixture.)
+    monkeypatch.setenv(_IN_PLACE_ENV, "1")
+    spec = A.convert_anthropic_to_genspec(_hoist_fixture(), {})
+    assert _roles(spec) == ["system", "user", "user", "assistant"]
+    assert spec.messages[0]["content"] == "top-level sys"
+    assert spec.messages[1]["content"] == "hello"
+    assert spec.messages[2]["content"] == "mid-stream sys"
+
+
+def test_convert_system_in_place_leading_system_joins_the_head_block(monkeypatch):
+    # D2: system-role messages before the first non-system message are the head block.
+    # Without this rule a body with no top-level `system` would lose its system block
+    # (the :132 fixture would become ["user", "assistant", "user"]).
+    monkeypatch.setenv(_IN_PLACE_ENV, "1")
+    req = AnthropicMessagesRequest.model_validate(
+        {
+            "model": "claude-x",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "system", "content": "and kind"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "hi"},
+            ],
+        }
+    )
+    spec = A.convert_anthropic_to_genspec(req, {})
+    assert _roles(spec) == ["system", "assistant", "user"]
+    assert spec.messages[0]["content"] == "be brief\n\nand kind"
+
+
+def test_convert_system_in_place_merges_a_run_and_drops_empty_texts(monkeypatch):
+    # D3/D4: consecutive in-place systems become ONE user turn joined by blank lines;
+    # empty ones vanish, and a run of only empty ones adds no turn at all.
+    monkeypatch.setenv(_IN_PLACE_ENV, "1")
+
+    def convert(messages):
+        req = AnthropicMessagesRequest.model_validate(
+            {"model": "claude-x", "max_tokens": 64, "system": "sys", "messages": messages}
+        )
+        return A.convert_anthropic_to_genspec(req, {})
+
+    spec = convert(
+        [
+            {"role": "user", "content": "hello"},
+            {"role": "system", "content": "a"},
+            {"role": "system", "content": ""},
+            {"role": "system", "content": [{"type": "text", "text": "b"}]},
+            {"role": "assistant", "content": "hi"},
+        ]
+    )
+    assert _roles(spec) == ["system", "user", "user", "assistant"]
+    assert spec.messages[2]["content"] == "a\n\nb"
+
+    spec = convert(
+        [
+            {"role": "user", "content": "hello"},
+            {"role": "system", "content": ""},
+            {"role": "assistant", "content": "hi"},
+        ]
+    )
+    assert _roles(spec) == ["system", "user", "assistant"]
+
+
+def test_convert_system_in_place_trailing_reminder_is_the_last_user_turn(monkeypatch):
+    # The dominant shape in Claude Code traffic (54 of 60 captured bodies): the turn's
+    # tool_result, then its <system-reminder>. In place, the reminder is the last user
+    # turn before the generation prompt, after the tool message the result became.
+    monkeypatch.setenv(_IN_PLACE_ENV, "1")
+    reminder = "<system-reminder>r</system-reminder>"
+    req = AnthropicMessagesRequest.model_validate(
+        {
+            "model": "claude-x",
+            "max_tokens": 64,
+            "system": "sys",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {"p": "x"}}],
+                },
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "body"}]},
+                {"role": "system", "content": reminder},
+            ],
+        }
+    )
+    spec = A.convert_anthropic_to_genspec(req, {})
+    assert _roles(spec) == ["system", "user", "assistant", "tool", "user"]
+    assert spec.messages[-1]["content"] == reminder
+
+
+def test_convert_system_in_place_count_tokens_sees_the_same_prompt(monkeypatch):
+    # D6: /v1/messages/count_tokens goes through convert_anthropic_prompt as well, so
+    # the counted prompt has the same shape as the generated one.
+    from freetoken.server.anthropic_models import AnthropicCountTokensRequest
+
+    monkeypatch.setenv(_IN_PLACE_ENV, "1")
+    body = _hoist_fixture().model_dump(exclude_none=True)
+    body.pop("max_tokens", None)
+    counted, *_ = A.convert_anthropic_prompt(AnthropicCountTokensRequest.model_validate(body))
+    generated = A.convert_anthropic_to_genspec(_hoist_fixture(), {}).messages
+    assert [m["role"] for m in counted] == [m["role"] for m in generated]
+    assert [m["content"] for m in counted] == [m["content"] for m in generated]
+
+
 # --------------------------------------------------------------------------- #
 # Non-streaming response formatting (GenResult -> Anthropic response)
 # --------------------------------------------------------------------------- #
