@@ -151,10 +151,19 @@ own と next の差                : 最大 1,834 トークン
 **D6. `count_tokens` は自動的に一致する。** 変更点は `convert_anthropic_prompt` の1箇所であり、
 `/v1/messages` と `/v1/messages/count_tokens` は同じ関数を通る（docstring がそう宣言している）。
 
-**D7. 切り替えは環境変数 `FREETOKEN_SYSTEM_IN_PLACE`。**
-段階1では**既定を現状のまま**にし、`=1` で新動作にした。
-理由は A/B を1つのビルドで測れるようにするため。段階4（106e4b6）で既定を反転し、
-いまは **`=0`（false / no / off）が旧動作の巻き上げに戻す opt-out**。未設定は在置き。
+**D7. 切り替えは CLI フラグ `--no-system-in-place`。起動時に方式を 1 行申告する。**（fa7b878 で改訂）
+段階1では環境変数 `FREETOKEN_SYSTEM_IN_PLACE=1` の opt-in で始めた。A/B を1つのビルドで測るため。
+段階4（106e4b6）で既定を反転したが、環境変数のままでは `--help` にも docs にもログにも出ず、
+既定の振る舞いを変えた変更の戻し方が見えない。査読で指摘され、次の形に改めた。
+
+* `ServerArgs.system_in_place = True`。`--no-system-in-place` で旧動作（`docs/cli.md` に記載）
+* 環境変数は互換のため残す。`FREETOKEN_SYSTEM_IN_PLACE=0` でも旧動作。**どちらか一方が OFF なら OFF**
+* serve は引数解析後に adapter の方式を一度だけ固定し、INFO で申告する:
+  `system messages: in place (...)` / `system messages: hoisted into the head system block (...)`
+* テスト: フラグ既定と `--no-system-in-place`、フラグと環境変数の合成、固定値が環境変数に勝つこと
+  （`tests/server/test_system_in_place_args.py`）
+
+「自分の状態を申告しない」がこの評価の主論点なので、自分の変更でそれを増やさないための改訂。
 
 ---
 
@@ -361,6 +370,29 @@ thinking の共通接頭辞は**中央値 2.8%**、52 本中 33 本が最初の 
 
 **これは MT の判断であり、この文書は判定しない。** 反転（段階4、106e4b6）は MT の「実装して」を受けて実装側が実行したもので、**MT が判断を述べた記録は無い**。戻すなら `git revert 106e4b6`、または起動時に `FREETOKEN_SYSTEM_IN_PLACE=0`。
 
+## 上流に出すなら（この箱の判断とは別）
+
+既定を変える根拠はこの箱の 1 セッション 60 本しか無く、他人の環境で行動が変わる変更を
+品質未測定のまま既定にはできない。出すなら 106e4b6 の形ではなく:
+
+* 既定 OFF の opt-in（`--system-in-place`）。実装は今の分岐そのまま、既定値だけ逆
+* 起動時の申告ログと `docs/cli.md` の 1 行はそのまま
+* 根拠として付けるのは 792 → 119 秒、生成込み 2.30 倍、decode 不変、出力が変わる事実（39/52、10/52）
+* 出すかどうか自体は費用の判断（#337 の後）。この文書は勧めない
+
+## 段階 5: 末尾 reminder の変種（計画）
+
+出力が変わった主因の候補は、60 本中 54 本で reminder が生成直前の user ターンになること。
+サーバーを変えずに body 側で変種を作り、同じ道具で出力一致率を測る:
+
+* 変種 `tailtool`: 会話末尾に続く system を、直前の user の最後の `tool_result` の中身へ畳む
+  （`freetoken-systest/tools/fold-trailing-reminders.py`）。途中の system は在置きのまま
+* 60 本のうち into-tool-result 53、appended-text-block 1、末尾に run 無し 6
+* 実行: `tools/measure-output-variant.sh`（`temperature=0`、`max_tokens=2048`、冷）
+* 比較: 保存済みの旧（巻き上げ）・新（`own`）の応答と、tool 名・引数・stop_reason の一致率
+* 判定基準を先に書く: 変種が **旧との一致率で `own` を明確に上回る**なら D1 の末尾規則を再考する。
+  同程度なら `own` のまま（忠実性で選んだ理由が残る）。**どちらでも「悪くなったか」は答えない**
+
 ## 決めていないこと
 
 * **出力品質。** ~~変わりうる~~ → **変わることは実測で確定した**（tool 引数は 10/52 しか一致しない。
@@ -403,6 +435,8 @@ thinking の共通接頭辞は**中央値 2.8%**、52 本中 33 本が最初の 
   **`results/20260907T031753-parity-*.json`**、`results/20260907T034703-selfparity-*.json`。
   **`results/*-parity-*.json` では指せない** —— `20260907T025643-parity-*` は
   `max_tokens=256` で打ち切りが 25/29 本出た**破棄した組**である
+* **D7 改訂済み（fa7b878）。** `--no-system-in-place`、起動時の申告ログ、`docs/cli.md` の行、テスト 3 本。
+  `tests/server` 638 本が既定と `=0` の両方で通る。
 * **段階 4 済み。** 106e4b6 で既定を在置きに反転。`FREETOKEN_SYSTEM_IN_PLACE=0`（false / no / off）が旧動作。
   旧動作を固定していたテストは `=0` の下で走る opt-out のテストに置き換え、既定 ON のテストを足した
   （`tests/server` 635 本、既定と `=0` の両方で全部通る）。
