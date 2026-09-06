@@ -26,6 +26,19 @@ from .base import BaseCacheHandle
 from .radix_cache import RadixTreeNode, _get_key_fn
 
 
+import os as _os
+
+from freetoken.utils import init_logger as _init_logger
+
+_L = _init_logger(__name__)
+_PFX2 = bool(_os.environ.get("FREETOKEN_PREFIX_DEBUG"))
+
+
+def _pfx2(msg: str) -> None:
+    if _PFX2:
+        _L.info("prefix-cache: %s", msg)
+
+
 @dataclass(frozen=True)
 class HybridCacheHandle(BaseCacheHandle):
     """Lock handle for a matched hybrid prefix: the matched node (lock target) + the reusable
@@ -80,11 +93,16 @@ class HybridRadixCache:
         node, _ = self._walk(input_ids)
         # walk up to the deepest node whose END boundary has a live snapshot
         cur, end_len = node, self._path_len(node)
+        _raw = end_len   # DEBUG: token match BEFORE snapshot truncation
         while not cur.is_root():
             if cur.mamba_value is not None:
+                _pfx2(f"walk  tok_match={_raw} -> snap_trunc={end_len} "
+                      f"(lost={_raw - end_len}) ask={len(input_ids)}")
                 return HybridMatch(self._collect_kv(cur), end_len, cur.mamba_value, cur)
             end_len -= cur.length
             cur = cur.parent
+        _pfx2(f"walk  tok_match={_raw} -> snap_trunc=0 (lost={_raw}) ask={len(input_ids)} "
+              f"NO-LIVE-SNAPSHOT-ON-PATH")
         return HybridMatch(self.empty, 0, None, self.root)
 
     def insert(self, input_ids: torch.Tensor, kv_indices: torch.Tensor,

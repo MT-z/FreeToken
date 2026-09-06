@@ -7,12 +7,24 @@ from typing import TYPE_CHECKING, List, Tuple
 import torch
 from freetoken.core import Req
 from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
-from freetoken.utils import align_down, div_ceil
+from freetoken.utils import align_down, div_ceil, init_logger
 
 if TYPE_CHECKING:
     from .utils import PendingReq
 
 # Proactive out-of-window free_swa runs every `interval` forwards (== sglang SWA_EVICTION_INTERVAL).
+# Prefix-cache tracing: FREETOKEN_PREFIX_DEBUG=1 prints one line per match and per insert.
+# Off by default and the calls are cheap when off; this exists because real agent traffic
+# re-prefills every turn while the wire log proves the prompts share a prefix.
+logger = init_logger(__name__)
+_PFX_DEBUG = bool(os.environ.get("FREETOKEN_PREFIX_DEBUG"))
+
+
+def _pfx(msg: str) -> None:
+    if _PFX_DEBUG:
+        logger.info("prefix-cache: %s", msg)
+
+
 def _swa_eviction_interval() -> int:
     raw = os.environ.get("FREETOKEN_SWA_EVICTION_INTERVAL", "128")
     try:
@@ -136,6 +148,8 @@ class CacheManager:
         if self.is_hybrid:
             from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
             m = self.prefix_cache.match_prefix(ids)
+            _pfx(f"match  ask={len(ids)} cached_len={m.cached_len} "
+                 f"mamba_value={m.mamba_value} kv={len(m.kv_indices) if m.kv_indices is not None else None}")
             return MatchResult(
                 HybridCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value)
         return self.prefix_cache.match_prefix(ids)
@@ -406,6 +420,7 @@ class CacheManager:
                 clone = self._clone_slot_for_tree(frozen)
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     _key_ids(req)[:L], page_indices[:L], clone)
+                _pfx(f"insert[frozen] L={L} -> prefix_len={prefix_len} mamba_exist={mamba_exist}")
                 if mamba_exist:
                     pool.free(clone)  # node already had a snapshot; clone unused
                 pool.free(list(req.mamba_ping_pong))
@@ -423,6 +438,8 @@ class CacheManager:
                 clone = self._clone_slot_for_tree(req.linear_slot_idx)
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     _key_ids(req)[:insert_len], page_indices[:insert_len], clone)
+                _pfx(f"insert[finish] len={insert_len} -> prefix_len={prefix_len} "
+                     f"mamba_exist={mamba_exist}")
                 if mamba_exist:
                     pool.free(clone)
                 self.unlock(old_handle)
@@ -449,6 +466,7 @@ class CacheManager:
         clone = self._clone_slot_for_tree(frozen)
         prefix_len, mamba_exist = self.prefix_cache.insert(
             _key_ids(req)[:L], page_indices[:L], clone)
+        _pfx(f"insert[chunk] L={L} -> prefix_len={prefix_len} mamba_exist={mamba_exist}")
         if mamba_exist:
             pool.free(clone)  # node already had a snapshot; clone unused
         self.unlock(old_handle)
