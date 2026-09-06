@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import json
 import os
@@ -1091,6 +1092,38 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     host = config.server_host
     port = config.server_port
 
+    # Decide the exclusion BEFORE anything is spawned. Held here, not further down: a
+    # refusal after start_backend() leaves the spawn children mid-startup, and they die
+    # with SemLock._rebuild FileNotFoundError tracebacks that read like a crash instead
+    # of the clean 'already running on pid N' this path is supposed to be.
+    # A pidfile the way gunicorn writes one (see _pidfile). On by default: a flag you have
+    # to remember is missing exactly when something has gone wrong. "" disables it.
+    pidfile_path = getattr(config, "pidfile", None)
+    if pidfile_path is None:
+        pidfile_path = _default_pidfile(port)
+    stack = contextlib.ExitStack()
+    if pidfile_path:
+        try:
+            stack.enter_context(_pidfile(pidfile_path))
+        except RuntimeError as exc:
+            logger.error("%s", exc)
+            raise SystemExit(1) from exc
+        except OSError as exc:
+            # An unwritable path must never stop a serve that would otherwise run.
+            logger.warning("pidfile: %s not written (%s)", pidfile_path, exc)
+            pidfile_path = ""
+        else:
+            logger.info("pidfile: wrote %d to %s", os.getpid(), pidfile_path)
+            # The ExitStack's finally only runs once `with stack:` is reached, and that is now
+            # ~90 lines below: a failure during startup would otherwise leave the file behind
+            # and make the next serve look at a stale pid. _release_pidfile only unlinks a file
+            # that still names us, so running twice is a no-op.
+            atexit.register(_release_pidfile, pidfile_path)
+            # Before uvicorn.run / the shell stop handlers: both re-raise the stopping
+            # signal into whatever handler preceded them, and this has to be it.
+            _install_pidfile_release_handlers(pidfile_path)
+
+
     # Create/validate FREETOKEN_API_LOG_DIR and start the writer thread up front, so a
     # bad path is reported at boot rather than silently on the first request.
     install_cors(app, config.cors_origins)
@@ -1175,28 +1208,6 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         name="freetoken-backend-supervisor",
         daemon=True,
     ).start()
-
-    # A pidfile the way gunicorn writes one (see _pidfile). On by default: a flag you have
-    # to remember is missing exactly when something has gone wrong. "" disables it.
-    pidfile_path = getattr(config, "pidfile", None)
-    if pidfile_path is None:
-        pidfile_path = _default_pidfile(port)
-    stack = contextlib.ExitStack()
-    if pidfile_path:
-        try:
-            stack.enter_context(_pidfile(pidfile_path))
-        except RuntimeError as exc:
-            logger.error("%s", exc)
-            raise SystemExit(1) from exc
-        except OSError as exc:
-            # An unwritable path must never stop a serve that would otherwise run.
-            logger.warning("pidfile: %s not written (%s)", pidfile_path, exc)
-            pidfile_path = ""
-        else:
-            logger.info("pidfile: wrote %d to %s", os.getpid(), pidfile_path)
-            # Before uvicorn.run / the shell stop handlers: both re-raise the stopping
-            # signal into whatever handler preceded them, and this has to be it.
-            _install_pidfile_release_handlers(pidfile_path)
 
     with stack:
         if run_shell:
