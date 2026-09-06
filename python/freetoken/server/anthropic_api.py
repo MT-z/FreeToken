@@ -205,10 +205,11 @@ def convert_anthropic_prompt(
     # messages before the first non-system one) and emit ONE system message at the
     # front: strict chat templates (e.g. Qwen3.5) require system at the beginning.
     # System-role messages Claude Code interleaves later in the array
-    # (<system-reminder>s) are hoisted into that block by default. With
-    # FREETOKEN_SYSTEM_IN_PLACE=1 each run of them stays where it was, as ONE user
-    # turn, so the prompt's head stops moving and the radix cache can match the
-    # previous turn (see .claude/DESIGN-system-in-place.md).
+    # (<system-reminder>s) stay where they were, as ONE user turn per run of them,
+    # so the prompt's head stops moving and the radix cache can match the previous
+    # turn (measured 792 -> 119 s of prefill over a captured session; see
+    # .claude/DESIGN-system-in-place.md). FREETOKEN_SYSTEM_IN_PLACE=0 restores the
+    # old behaviour of hoisting them all into the head block.
     in_place = _system_in_place()
     system_texts: list[str] = []
     if req.system:
@@ -374,10 +375,11 @@ _SYSTEM_IN_PLACE_ENV = "FREETOKEN_SYSTEM_IN_PLACE"
 
 
 def _system_in_place() -> bool:
-    """Stage-1 switch, default off: keep system-role messages that follow the first
-    non-system message where they are (as user turns) instead of hoisting them into
-    the head system block. Read per call so one process can compare both."""
-    return os.environ.get(_SYSTEM_IN_PLACE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+    """Default on (stage 4 of the design): system-role messages that follow the first
+    non-system message stay where they are, as user turns. FREETOKEN_SYSTEM_IN_PLACE=0
+    (or false/no/off) hoists them into the head system block as before. Read per
+    call so one process can compare both."""
+    return os.environ.get(_SYSTEM_IN_PLACE_ENV, "").strip().lower() not in ("0", "false", "no", "off")
 
 
 def _content_text(content) -> str:

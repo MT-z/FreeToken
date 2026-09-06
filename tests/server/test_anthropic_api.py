@@ -17,6 +17,8 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _PY = os.path.join(_ROOT, "python")
 if _PY not in sys.path:
@@ -228,10 +230,12 @@ def test_convert_thinking_replay_in_tool_loop():
     assert spec.messages[2]["role"] == "tool"
 
 
-def test_convert_hoists_and_merges_system_messages():
-    # Claude Code interleaves system messages mid-array; strict chat templates
-    # (e.g. Qwen3.5: "System message must be at the beginning") require ONE system
-    # message at the front. Merge top-level system + in-array system, hoist to front.
+@pytest.mark.parametrize("off", ["0", "false", "no", "off"])
+def test_convert_hoists_system_messages_when_in_place_is_off(monkeypatch, off):
+    # FREETOKEN_SYSTEM_IN_PLACE=0 restores the pre-stage-4 behaviour: merge top-level
+    # system + in-array system and hoist them to the front as ONE system message
+    # (strict templates, e.g. Qwen3.5, require system at the beginning either way).
+    monkeypatch.setenv("FREETOKEN_SYSTEM_IN_PLACE", off)
     req = AnthropicMessagesRequest.model_validate(
         {
             "model": "claude-x",
@@ -251,9 +255,9 @@ def test_convert_hoists_and_merges_system_messages():
     assert "mid-stream sys" in spec.messages[0]["content"]
 
 
-# --- FREETOKEN_SYSTEM_IN_PLACE (stage 1 of .claude/DESIGN-system-in-place.md) ---------- #
-# Default off: the hoist above stays. On: system-role messages after the first
-# non-system one stay where they were, as user turns, so the prompt head stops moving.
+# --- FREETOKEN_SYSTEM_IN_PLACE (.claude/DESIGN-system-in-place.md) -------------------- #
+# Default on since stage 4: system-role messages after the first non-system one stay
+# where they were, as user turns, so the prompt head stops moving. =0 restores the hoist.
 
 _IN_PLACE_ENV = "FREETOKEN_SYSTEM_IN_PLACE"
 
@@ -278,11 +282,12 @@ def _hoist_fixture() -> AnthropicMessagesRequest:
     )
 
 
-def test_convert_system_in_place_default_is_off(monkeypatch):
+def test_convert_system_in_place_default_is_on(monkeypatch):
     monkeypatch.delenv(_IN_PLACE_ENV, raising=False)
     spec = A.convert_anthropic_to_genspec(_hoist_fixture(), {})
-    assert _roles(spec) == ["system", "user", "assistant"]
-    assert "mid-stream sys" in spec.messages[0]["content"]  # still hoisted
+    assert _roles(spec) == ["system", "user", "user", "assistant"]
+    assert spec.messages[0]["content"] == "top-level sys"  # nothing hoisted into the head
+    assert spec.messages[2]["content"] == "mid-stream sys"
 
 
 def test_convert_system_in_place_keeps_mid_system_as_its_own_user_turn(monkeypatch):
