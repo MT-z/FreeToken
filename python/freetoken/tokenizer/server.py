@@ -205,7 +205,7 @@ def tokenize_worker(
     tokenizer = load_tokenizer(tokenizer_path)
     logger = init_logger(__name__, f"tokenizer_{tokenizer_id}")
 
-    from .detokenize import DetokenizeManager
+    from .detokenize import DetokenizeManager, build_logprobs_entry
     from .tokenize import TokenizeManager
 
     # Image input needs the checkpoint's HF processor. Gate it on the same switch the
@@ -295,6 +295,19 @@ def tokenize_worker(
                         swa_used_tokens=msg.swa_used_tokens,
                         swa_total_tokens=msg.swa_total_tokens,
                         gpu_mem_bytes=msg.gpu_mem_bytes,
+                        # Stop-string trimming can hide final visible text; keep one logprob
+                        # entry per sampled token.
+                        logprobs=(
+                            build_logprobs_entry(
+                                detokenize_manager.tokenizer,
+                                msg.next_token,
+                                msg.chosen_logprob,
+                                msg.top_ids,
+                                msg.top_logprobs,
+                            )
+                            if msg.chosen_logprob is not None
+                            else None
+                        ),
                     )
                     for msg, reply, reasoning_tokens in zip(
                         detokenize_msg, replies, reasoning_counts, strict=True
