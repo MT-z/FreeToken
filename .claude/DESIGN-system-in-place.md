@@ -55,6 +55,8 @@ reminder を **assistant ターンを飛び越えて1ターン後ろへ動かす
 | `own` その場で独立 user ターン | **96.2%** | 33/58 | 保たれる |
 
 一次出力: `freetoken-systest/results/20260907T015806-diag_prefix-cache-placement-3way.json`
+道具: `freetoken-systest/tools/prefix-placement-3way.py`（`prefix-hoist-compare.py` の `place_in_place` を 3 通りで回す。
+`prefix-hoist-compare.py` 単体の `main` は `next` しか測らない）
 
 **「3通り同じ」なのは合計比の話であって、組ごとには一致しない。**
 
@@ -117,7 +119,7 @@ own と next の差                : 最大 1,834 トークン
 
 **D7. 切り替えは環境変数 `FREETOKEN_SYSTEM_IN_PLACE`。**
 段階1では**既定を現状のまま**にし、フラグで新動作にする。
-理由は A/B を1つのビルドで測れるようにするため。実機の時間が取れたら段階2で既定を反転する。
+理由は A/B を1つのビルドで測れるようにするため。実機の時間が取れたら段階4で既定を反転する。
 
 ---
 
@@ -149,8 +151,9 @@ own と next の差                : 最大 1,834 トークン
 
 ## 検証（何をもって「効いた」とするか）
 
-1. **オフライン（GPU 不要）**: `prefix-hoist-compare.py` で 53.0% → 96.2%、悪化組なし。
-   **これは既に測ってある。実装がこの変換と一致することの確認に使う。**
+1. **オフライン（GPU 不要）**: `prefix-hoist-compare.py`（`next`）と `prefix-placement-3way.py`（3 通り）で
+   53.0% → 96.2%、悪化組なし。**これは既に測ってある。** 段階 2 では、実装（フラグ ON）の出力が
+   `prefix-placement-3way.py` の `own` 変換と **body ごとにトークン列で一致**することを確認する。
 2. **単体**: 上記2件を含む `tests/server/test_anthropic_api.py` が通る。
 3. **実機（唯一の未測定）**: 同一プロンプト列を冷↔冷で流し、**端から端までの時間**と
    `#cached-token` を新旧で比べる。**トークン一致長ではなく時間で示す。**
@@ -171,16 +174,30 @@ own と next の差                : 最大 1,834 トークン
   尾（総 − 共通）の中央値は、99% に届く 33 組が **191 トークン**、届かない 25 組が **2,321 トークン**。
   尾が大きい4組の正体は、大きな `tool_result` を足した組（18,403 / 9,657）、
   除外した `req-00018` をまたぐ組（29,323）、別会話の境界（74,865）。**未解決項目から外す。**
+  （数値はすべて `next` 列。D1 の `own` では 190 / 2,246、4 組は 18,398 / 9,537 / 29,318 / 74,869 で同傾向。）
 
 ---
 
 ## 段階
 
 1. `own` を `FREETOKEN_SYSTEM_IN_PLACE` の裏に実装。新動作のテストを足す。既定は現状のまま
-2. オフライン比較で、実装の出力が測定済みの `own` 変換と一致することを確認
+2. オフライン比較（`tools/prefix-placement-3way.py` と同じ描画経路）で、実装の出力が測定済みの `own` 変換と body ごとに一致することを確認
 3. 実機で新旧の時間を測る（冷↔冷）。出力を1回見る
 4. 数字が出たら既定を反転し、旧動作のテストを置き換える
 
+### 進捗（2026-09-07）
+
+* **段階 1 済み。** 枝 `feat/system-in-place`（`diag/prefix-cache` から）。`convert_anthropic_prompt` に
+  `FREETOKEN_SYSTEM_IN_PLACE` を読む分岐を足し、D1〜D5 をそのまま実装。既定は現状のまま。
+  新動作のテスト 6 本を `tests/server/test_anthropic_api.py` に追加（既定 OFF、`own` の role 列、
+  D2 の先頭 system、D3/D4 の連結と空文字、末尾 reminder、D6 の count_tokens 一致）。
+* **段階 2 済み。** `tools/system-in-place-stage2.py`（systest）で、フラグ ON の実装の描画と
+  `place_in_place(o, "own")` → フラグ OFF の描画を body ごとに比べた。
+  **59 本中 59 本でトークン列が同一。** 連続 58 組の合計比 96.2%、99% 以上 33 組、
+  100 トークン超の悪化 0 組で、3 通り計測の `own` 列と一致する。
+  一次出力: `freetoken-systest/results/20260907T021343-diag_system-in-place-stage2.json`
+* **段階 3 は未着手（GPU）。** 段階 4 はその数字を待つ。
+
 ---
 
-本設計の作成には Claude Opus 5 を用いた。数値はこの箱での実測。
+本設計の作成には Claude Opus 5、査読と修正・実装には Claude Fable 5.1 を用いた。数値はこの箱での実測。
