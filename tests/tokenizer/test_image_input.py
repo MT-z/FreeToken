@@ -485,6 +485,63 @@ def test_a_chunk_with_no_image_tokens_scatters_nothing(monkeypatch):
     assert out.abs().sum().item() == 0.0
 
 
+def test_walking_a_prompt_chunk_by_chunk_consumes_every_row_exactly_once(monkeypatch):
+    """What prefill.py:203-209 asserts in prose and nothing measured: a chunk boundary may fall
+    between two images, INSIDE one image's placeholder run, or between an image and the text
+    around it, and the scatter still keeps track of which rows are still owed.
+
+    The two tests above each drive ONE forward with a hand-set ``cached_len``. This walks the
+    whole prompt the way the scheduler does -- ``cached_len`` advancing by each chunk -- and
+    checks the accumulated window: every row of ``mm_embeds`` lands at its own placeholder,
+    once, and no placeholder gets someone else's row.
+
+    Without it, ``before`` could drift by a row and every test here would still pass; what
+    surfaces in production is one image's embedding sitting in another image's tokens, which
+    is not an error at any layer -- the shapes still match.
+    """
+    import torch
+    from types import SimpleNamespace
+
+    import freetoken.models.qwen3_5_moe.model as mod
+
+    IMG = 151655
+    # 3 + 4 + 2 = 9 placeholders, with text between the runs.
+    ids = [7, 7, IMG, IMG, IMG, 7, IMG, IMG, IMG, IMG, 7, 7, IMG, IMG, 7]
+    prompt = torch.tensor(ids)
+    n_img = sum(1 for t in ids if t == IMG)
+    # Row i is [i+1, i+1], so a misplaced row is identifiable rather than merely wrong.
+    embeds = torch.tensor([[float(i + 1)] * 2 for i in range(n_img)])
+
+    # Boundaries chosen for the three cases the comment names: 6 splits BETWEEN runs,
+    # 8 splits INSIDE the 4-placeholder run, 13 splits an image from the text after it.
+    bounds = [0, 6, 8, 13, len(ids)]
+    out = torch.zeros(len(ids), 2)
+    for lo, hi in zip(bounds, bounds[1:]):
+        req = SimpleNamespace(
+            uid=1, extend_len=hi - lo, mm_embeds=embeds, cached_len=lo, input_ids=prompt,
+        )
+        batch = SimpleNamespace(reqs=[req], has_images=True)
+        monkeypatch.setattr(mod, "get_global_ctx", lambda b=batch: SimpleNamespace(batch=b))
+        out[lo:hi] = mod.Qwen3_5Model._merge_multimodal(
+            SimpleNamespace(_image_token_id=IMG), prompt[lo:hi], torch.zeros(hi - lo, 2)
+        )
+
+    # Every placeholder carries the row for its own index in prompt order; text stays zero.
+    seen = 0
+    for pos, tok in enumerate(ids):
+        if tok == IMG:
+            seen += 1
+            assert out[pos].tolist() == [float(seen)] * 2, (
+                f"placeholder #{seen} at position {pos} got row {out[pos].tolist()}, "
+                f"expected {[float(seen)] * 2} -- the window drifted"
+            )
+        else:
+            assert out[pos].abs().sum().item() == 0.0, (
+                f"text at position {pos} was scattered into"
+            )
+    assert seen == n_img, "not every placeholder was visited"
+
+
 # ------------------------------------------------------- prefix-cache keys for image prompts
 def _ck(input_ids, images, tok_id=151655):
     import torch
