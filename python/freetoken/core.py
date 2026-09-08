@@ -103,6 +103,12 @@ class Req:
     # chunk's commit can donate that face too -- a branch inside the final chunk then reuses up to
     # one chunk earlier instead of finding no live snapshot at all.
     mamba_prev_track_seqlen: int | None = None
+    # Fork length: the tree matched this request's tokens up to here (tok_match) but its deepest
+    # live snapshot was shorter, so [cached_len, fork) is re-prefilled. The prefill chunk that
+    # spans it tracks its ×64 snapshot AT the fork instead of at the chunk's deepest boundary,
+    # so the next request branching at the same point (a fan-out sibling) reuses the shared
+    # prefix instead of nothing. Cleared once that chunk has run.
+    mamba_fork_len: int | None = None
     mamba_restore_src: int | None = None            # on a prefix hit: tree snapshot slot to COW into the live slot (first chunk only)
     swa_evicted_seqlen: int = 0                      # SWA radix: positions < this had their swa KV freed (slid out of window) during decode
     decode_batch_idx: int = 0                        # SWA radix: # of decode forwards done; the proactive free_swa skips the first (overlap guard)

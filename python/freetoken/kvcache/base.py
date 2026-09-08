@@ -258,6 +258,8 @@ class MatchResult(NamedTuple):
     # Hybrid (GDN) models: the restored GDN state snapshot slot for this prefix (None = cold /
     # non-hybrid). Surfaced by HybridRadixCache via CacheManager.match_req.
     mamba_value: int | None = None
+    # Hybrid only: tokens matched before the snapshot truncation (>= cuda_handle.cached_len).
+    tok_match: int | None = None
     # TODO: support HiCache
 
 

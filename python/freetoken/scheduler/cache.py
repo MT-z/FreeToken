@@ -151,7 +151,8 @@ class CacheManager:
             _pfx(f"match  ask={len(ids)} cached_len={m.cached_len} "
                  f"mamba_value={m.mamba_value} kv={len(m.kv_indices) if m.kv_indices is not None else None}")
             return MatchResult(
-                HybridCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value)
+                HybridCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value,
+                tok_match=m.tok_match)
         return self.prefix_cache.match_prefix(ids)
 
     @property

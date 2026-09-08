@@ -58,6 +58,10 @@ class HybridMatch(NamedTuple):
     cached_len: int               # truncated to the deepest LIVE-snapshot boundary
     mamba_value: Optional[int]    # GDN snapshot slot to restore from (None = cold start)
     node: RadixTreeNode           # the matched node (lock target)
+    # Token match BEFORE the snapshot truncation. Where it exceeds cached_len the tree holds
+    # this request's tokens but no state at them: the request re-prefills [cached_len, tok_match)
+    # and, if it tracks a snapshot at the fork, the next request that branches there can reuse it.
+    tok_match: int = 0
 
 
 class EvictResult(NamedTuple):
@@ -93,17 +97,17 @@ class HybridRadixCache:
         node, _ = self._walk(input_ids)
         # walk up to the deepest node whose END boundary has a live snapshot
         cur, end_len = node, self._path_len(node)
-        _raw = end_len   # DEBUG: token match BEFORE snapshot truncation
+        _raw = end_len   # token match BEFORE snapshot truncation (surfaced as tok_match)
         while not cur.is_root():
             if cur.mamba_value is not None:
                 _pfx2(f"walk  tok_match={_raw} -> snap_trunc={end_len} "
                       f"(lost={_raw - end_len}) ask={len(input_ids)}")
-                return HybridMatch(self._collect_kv(cur), end_len, cur.mamba_value, cur)
+                return HybridMatch(self._collect_kv(cur), end_len, cur.mamba_value, cur, _raw)
             end_len -= cur.length
             cur = cur.parent
         _pfx2(f"walk  tok_match={_raw} -> snap_trunc=0 (lost={_raw}) ask={len(input_ids)} "
               f"NO-LIVE-SNAPSHOT-ON-PATH")
-        return HybridMatch(self.empty, 0, None, self.root)
+        return HybridMatch(self.empty, 0, None, self.root, _raw)
 
     def insert(self, input_ids: torch.Tensor, kv_indices: torch.Tensor,
                mamba_value: int) -> Tuple[int, bool]:

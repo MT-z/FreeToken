@@ -337,3 +337,114 @@ def test_prefill_continuation_carries_the_uncommitted_track_boundary():
     last = add(512)
     assert not isinstance(last, ChunkedReq) and last.cached_len == 192
     assert last.mamba_prev_track_seqlen == 64 and last.mamba_next_track_idx == 1
+
+
+# ---------------------------------------------------------------- fork-boundary tracking (c)
+
+def test_match_reports_the_token_match_beyond_the_snapshot_truncation():
+    """Tree holds [1..8] with snapshots at 4 and 8 (the two-face donation above). A request
+    sharing [1..6] matches 6 tokens but can only resume from 4: cached_len 4, tok_match 6.
+    A cold request reports 0/0; one whose match ends exactly on a snapshot reports equal."""
+    pool = _pool()
+    pt = torch.zeros(4, 64, dtype=torch.int32)
+    cm = CacheManager(64, 1, pt, "hybrid_radix", linear_state_pool=pool)
+    ids = list(range(1, 11))
+    req, _pp, _pages = _admit_cold(cm, pool, pt, ids, row=0)
+    req.mamba_prev_track_seqlen, req.mamba_last_track_seqlen, req.mamba_next_track_idx = 4, 8, 0
+    cm.cache_req(req, finished=False)
+    m = cm.match_req(_pend(ids[:6] + [99, 100]))          # key = first 7 ids -> matches 6
+    assert (m.cuda_handle.cached_len, m.tok_match) == (4, 6)
+    m = cm.match_req(_pend(ids[:4] + [99, 100]))          # match ends on the snapshot
+    assert (m.cuda_handle.cached_len, m.tok_match) == (4, 4)
+    m = cm.match_req(_pend([50, 51, 52]))                 # cold
+    assert (m.cuda_handle.cached_len, m.tok_match) == (0, 0)
+
+
+def test_prefill_admission_records_the_fork_and_carries_it_across_chunks():
+    """PrefillAdder turns tok_match > cached_len into Req.mamba_fork_len (None when the match
+    ends on a snapshot or the request is cold) and hands it on to continuation chunks."""
+    from freetoken.scheduler.prefill import ChunkedReq, PrefillAdder
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    pool = _pool(num_slots=32)               # four admissions x 3 slots + donor + clones
+    pt = torch.zeros(8, 64, dtype=torch.int32)
+    cm = CacheManager(64, 1, pt, "hybrid_radix", linear_state_pool=pool)
+    tm = TableManager(max_running_reqs=8, page_table=pt)
+    ids = list(range(1, 11))
+    donor, _pp, _pages = _admit_cold(cm, pool, pt, ids, row=0)
+    donor.mamba_prev_track_seqlen, donor.mamba_last_track_seqlen, donor.mamba_next_track_idx = 4, 8, 0
+    cm.cache_req(donor, finished=False)
+
+    def admit(prompt, budget):
+        pend = PendingReq(1, torch.tensor(prompt, dtype=torch.int32), SamplingParams(max_tokens=1))
+        adder = PrefillAdder(token_budget=budget, reserved_size=0, cache_manager=cm, table_manager=tm)
+        return pend, adder.try_add_one(pend)
+
+    # branches at 6: resumes from 4, fork recorded at 6
+    _, req = admit(ids[:6] + [99, 100], budget=64)
+    assert (req.cached_len, req.mamba_fork_len) == (4, 6)
+    # match ends exactly on the snapshot: nothing to fork
+    _, req = admit(ids[:4] + [99, 100], budget=64)
+    assert (req.cached_len, req.mamba_fork_len) == (4, None)
+    # cold: nothing to fork
+    _, req = admit([50, 51, 52, 53], budget=64)
+    assert (req.cached_len, req.mamba_fork_len) == (0, None)
+    # chunked: the fork rides along on the continuation until a chunk consumes it
+    pend, chunk = admit(ids[:6] + list(range(100, 130)), budget=2)   # 36 tokens, chunk of 2
+    assert isinstance(chunk, ChunkedReq) and chunk.mamba_fork_len == 6
+    chunk.cached_len = chunk.device_len
+    pend.chunked_req = chunk
+    cont = PrefillAdder(token_budget=2, reserved_size=0, cache_manager=cm, table_manager=tm).try_add_one(pend)
+    assert cont.mamba_fork_len == 6
+    chunk.mamba_fork_len = None                                        # a forward consumed it
+    cont2 = PrefillAdder(token_budget=2, reserved_size=0, cache_manager=cm, table_manager=tm).try_add_one(pend)
+    assert cont2.mamba_fork_len is None
+
+
+def _track_boundary(*, cached_len, extend_len, fork, pool):
+    """Run _build_track_metadata on one hand-built request; return (boundary, remaining fork)."""
+    from freetoken import core
+    from freetoken.attention.linear import _build_track_metadata
+    from freetoken.core import Context, set_global_ctx
+
+    core._GLOBAL_CTX = None  # test-only: the builder reads the state pool off the ctx
+    set_global_ctx(Context(page_size=1, linear_state_pool=pool))
+    try:
+        r = SimpleNamespace(cached_len=cached_len, extend_len=extend_len, mamba_fork_len=fork,
+                            mamba_ping_pong=(1, 2), mamba_next_track_idx=0,
+                            mamba_last_track_seqlen=None)
+        cu = torch.tensor([0, extend_len], dtype=torch.int32)
+        md = _build_track_metadata([r], cu, torch.device("cpu"), {})
+        if md["track_dst"] is None:
+            return None, r.mamba_fork_len
+        return r.mamba_last_track_seqlen, r.mamba_fork_len
+    finally:
+        core._GLOBAL_CTX = None
+
+
+def test_track_boundary_moves_to_the_fork_when_the_extend_spans_it():
+    """Default: the deepest ×64 boundary strictly inside the extend. With a fork inside the
+    extend: the deepest ×64 boundary at or before the fork, and the fork is consumed. A fork
+    beyond this extend is left for a later chunk; one within the first 64 tokens (no boundary
+    at or before it) or already behind the extend falls back to the default and is dropped."""
+    pool = _pool()
+
+    def T(**kw):
+        return _track_boundary(pool=pool, **kw)
+    assert T(cached_len=0, extend_len=8192, fork=None) == (8128, None)           # (b) today
+    assert T(cached_len=90048, extend_len=6018, fork=None) == (96064, None)
+    # 96k probe, 2nd request: cached 90,048, extend 6,018, fork 96,047 -> 90,048 + 93*64
+    assert T(cached_len=90048, extend_len=6018, fork=96047) == (96000, None)
+    # fan-out sibling, chunk 16,384..24,576 spanning the 24,152 fork -> 16,384 + 121*64
+    assert T(cached_len=16384, extend_len=8192, fork=24152) == (24128, None)
+    # fork lies in a later chunk: default boundary, fork kept for that chunk
+    assert T(cached_len=8192, extend_len=8192, fork=24152) == (16320, 24152)
+    # fork exactly at the extend end is not strictly inside: default, kept for the next chunk
+    assert T(cached_len=8192, extend_len=8192, fork=16384) == (16320, 16384)
+    # fork within the first 64 tokens of the extend: nothing to track at it -> default, dropped
+    assert T(cached_len=90048, extend_len=6018, fork=90100) == (96064, None)
+    # fork already behind this extend (stale): default, dropped
+    assert T(cached_len=90048, extend_len=6018, fork=90000) == (96064, None)
+    # an extend of one GDN chunk or less tracks nothing, fork or not
+    assert T(cached_len=96000, extend_len=64, fork=96047) == (None, 96047)

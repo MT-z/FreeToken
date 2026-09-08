@@ -118,6 +118,20 @@ def _build_track_metadata(reqs, cu_host, device, pin):
         c = (r.extend_len - 1) // CHUNK_SIZE
         if c < 1:
             continue
+        fork = getattr(r, "mamba_fork_len", None)  # stub reqs in tests carry no fork
+        if fork is not None and fork <= r.cached_len + c * CHUNK_SIZE:
+            # This extend spans the fork (tokens the tree matched but had no snapshot at).
+            # Track the deepest boundary AT OR BEFORE the fork instead of the extend's deepest
+            # one: the request re-prefills these tokens anyway, and a snapshot there is
+            # exactly what the next request branching at the same point can resume from.
+            # Costs nothing extra -- h already holds every per-chunk state of the extend.
+            # Whether the face survives to the final-chunk commit follows from the two
+            # ping-pong slots: it does if this is the final or the previous chunk.
+            cf = (fork - r.cached_len) // CHUNK_SIZE
+            if cf >= 1:
+                c = cf
+            # cf == 0: no boundary at or before the fork inside this extend -- keep the default
+            r.mamba_fork_len = None  # consumed (or unreachable); later chunks track as usual
         off = int(cu_host[i])
         boundary = r.cached_len + c * CHUNK_SIZE
         dst.append(r.mamba_ping_pong[r.mamba_next_track_idx])

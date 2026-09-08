@@ -135,7 +135,13 @@ class PrefillAdder:
             linear_slot_idx = pool.alloc(1)[0]
             ping_pong = tuple(pool.alloc(2))
 
-        return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value
+        # Fork: the tree matched more tokens than it could hand over (no live snapshot at
+        # them). Remember where, so the chunk that re-prefills across it tracks a snapshot
+        # there for the next request branching at the same point.
+        fork_len = None
+        if ping_pong is not None and mr.tok_match is not None and mr.tok_match > cached_len:
+            fork_len = mr.tok_match
+        return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value, fork_len
 
     def _add_one_req(
         self,
@@ -150,6 +156,7 @@ class PrefillAdder:
         swa_evicted_seqlen: int = 0,
         chunked_req: Req | None = None,
         prev_track_seqlen: int | None = None,
+        fork_len: int | None = None,
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
@@ -235,6 +242,7 @@ class PrefillAdder:
         req.mamba_ping_pong = ping_pong
         req.mamba_next_track_idx = next_track_idx
         req.mamba_prev_track_seqlen = prev_track_seqlen
+        req.mamba_fork_len = fork_len
         req.mamba_restore_src = restore_src
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
         return req
@@ -266,10 +274,11 @@ class PrefillAdder:
                     if chunked_req.mamba_last_track_seqlen is not None
                     else chunked_req.mamba_prev_track_seqlen
                 ),
+                fork_len=chunked_req.mamba_fork_len,  # still ahead of us, or already consumed (None)
             )
 
         if resource := self._try_allocate_one(pending_req):
-            cache_handle, table_idx, linear_slot_idx, ping_pong, restore_src = resource
+            cache_handle, table_idx, linear_slot_idx, ping_pong, restore_src, fork_len = resource
             req = self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=cache_handle,
@@ -279,6 +288,7 @@ class PrefillAdder:
                 ping_pong=ping_pong,
                 next_track_idx=0,
                 restore_src=restore_src,
+                fork_len=fork_len,
             )
             if req is None:
                 # Declined -- no aligned chunk this pass, or terminal. Either way nothing was
