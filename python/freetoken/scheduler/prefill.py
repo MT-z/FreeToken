@@ -149,6 +149,7 @@ class PrefillAdder:
         restore_src: int | None = None,
         swa_evicted_seqlen: int = 0,
         chunked_req: Req | None = None,
+        prev_track_seqlen: int | None = None,
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
@@ -233,6 +234,7 @@ class PrefillAdder:
         req.linear_slot_idx = linear_slot_idx
         req.mamba_ping_pong = ping_pong
         req.mamba_next_track_idx = next_track_idx
+        req.mamba_prev_track_seqlen = prev_track_seqlen
         req.mamba_restore_src = restore_src
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
         return req
@@ -256,6 +258,14 @@ class PrefillAdder:
                 restore_src=None,  # continuation chunk already has live state
                 swa_evicted_seqlen=chunked_req.swa_evicted_seqlen,  # extend-free watermark so far
                 chunked_req=chunked_req,
+                # The chunk that just ran skipped cache_req (scheduler: overlap double-free), so
+                # the ×64 boundary it tracked is still only in its ping-pong slot. Hand it on; if
+                # this chunk crossed no boundary the older carried one is still the face's state.
+                prev_track_seqlen=(
+                    chunked_req.mamba_last_track_seqlen
+                    if chunked_req.mamba_last_track_seqlen is not None
+                    else chunked_req.mamba_prev_track_seqlen
+                ),
             )
 
         if resource := self._try_allocate_one(pending_req):

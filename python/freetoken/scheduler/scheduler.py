@@ -321,6 +321,9 @@ class Scheduler(SchedulerIOMixin):
                     # Don't cache intermediate chunks; the full prompt is cached once when the
                     # final chunk is processed. Caching here snapshots a handle the next chunk
                     # already copied (overlap), so cache_req double-frees the prior chunk.
+                    # The ×64 boundary this chunk tracked is not lost: PrefillAdder carries it
+                    # onto the continuation as mamba_prev_track_seqlen and the final chunk's
+                    # commit donates that ping-pong face alongside its own.
                     if req.aborted:
                         # Aborted mid-chunked-prefill while this chunk was in flight: the abort
                         # popped the pending continuation (no next chunk launches), and this

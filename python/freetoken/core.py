@@ -98,6 +98,11 @@ class Req:
     mamba_ping_pong: tuple[int, int] | None = None  # 2 donatable track slots under overlap
     mamba_next_track_idx: int = 0                   # which ping-pong slot is the next snapshot dst (0/1)
     mamba_last_track_seqlen: int | None = None      # chunk-aligned committed len of the last snapshot
+    # ×64 boundary the PREVIOUS prefill chunk tracked into the other ping-pong slot and never
+    # committed (intermediate chunks skip cache_req). Carried onto the continuation so the final
+    # chunk's commit can donate that face too -- a branch inside the final chunk then reuses up to
+    # one chunk earlier instead of finding no live snapshot at all.
+    mamba_prev_track_seqlen: int | None = None
     mamba_restore_src: int | None = None            # on a prefix hit: tree snapshot slot to COW into the live slot (first chunk only)
     swa_evicted_seqlen: int = 0                      # SWA radix: positions < this had their swa KV freed (slid out of window) during decode
     decode_batch_idx: int = 0                        # SWA radix: # of decode forwards done; the proactive free_swa skips the first (overlap guard)

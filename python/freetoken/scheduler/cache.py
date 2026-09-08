@@ -391,8 +391,10 @@ class CacheManager:
         """Hybrid (GDN) cache_req: commit KV like radix AND manage the GDN state snapshot.
         Prefill chunk commit: donate a PRIVATE CLONE of the frozen ping-pong slot (the
         snapshot the forward wrote at the tracked ×64 boundary mamba_last_track_seqlen)
-        into the tree; the request keeps its own slots. Finish: donate a clone of the live
-        slot (final full-sequence state) and free all of the req's slots."""
+        into the tree, and -- for a chunked prompt -- a clone of the OTHER face too (the
+        boundary the previous chunk tracked, mamba_prev_track_seqlen, which intermediate
+        chunks never commit); the request keeps its own slots. Finish: donate a clone of the
+        live slot (final full-sequence state) and free all of the req's slots."""
         from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
 
         pool = self.linear_state_pool
@@ -451,39 +453,70 @@ class CacheManager:
             self._free_req_slots(req, keep_live=keep_live)
             return
 
-        # Prefill chunk commit: donate the frozen snapshot at the tracked ×64 boundary.
+        # Prefill chunk commit: donate the frozen snapshot at the tracked ×64 boundary -- and,
+        # for a chunked prompt, the boundary the PREVIOUS chunk tracked into the other face.
+        # Intermediate chunks skip cache_req (scheduler: overlap double-free), so that face is
+        # otherwise the only copy and gets overwritten two tracks later. Without it, a branch
+        # anywhere inside the final chunk finds no live snapshot at or before its divergence and
+        # re-prefills the whole prompt (measured: 0 reuse at 96k while 120k reused 119,808).
         L = req.mamba_last_track_seqlen
-        if L is None:
-            return  # no ×64 boundary crossed this chunk; req keeps its pages (committed later)
-        if align_down(L, self.page_size) != L:
+        P = req.mamba_prev_track_seqlen
+        req.mamba_prev_track_seqlen = None  # donatable only here; consumed or dropped below
+        if L is not None and align_down(L, self.page_size) != L:
             # page_size>1 only: insert would align the key down, attaching a state that encodes
             # L tokens to a SHORTER node -- a future hit would COW-restore an over-advanced
             # state. Skip; the next aligned boundary (or the finish-donate) commits instead.
             req.mamba_last_track_seqlen = None
-            return
-        frozen_idx = 1 - req.mamba_next_track_idx          # the slot the forward just wrote
-        frozen = req.mamba_ping_pong[frozen_idx]
-        clone = self._clone_slot_for_tree(frozen)
-        prefix_len, mamba_exist = self.prefix_cache.insert(
-            _key_ids(req)[:L], page_indices[:L], clone)
-        _pfx(f"insert[chunk] L={L} -> prefix_len={prefix_len} mamba_exist={mamba_exist}")
-        if mamba_exist:
-            pool.free(clone)  # node already had a snapshot; clone unused
+            L = None
+        donations: list[tuple[int, int]] = []  # (boundary, slot), shortest first
+        if (
+            P is not None
+            and req.mamba_ping_pong is not None
+            and (L is None or P < L)
+            and 0 < P <= req.cached_len
+            and align_down(P, self.page_size) == P
+        ):
+            # The face the forward did NOT write this chunk: after this chunk's write flipped
+            # next away from it that is ping_pong[next]; with no boundary crossed this chunk
+            # (no write, no flip) it is still ping_pong[1 - next].
+            prev_idx = req.mamba_next_track_idx if L is not None else 1 - req.mamba_next_track_idx
+            donations.append((P, req.mamba_ping_pong[prev_idx]))
+        if L is not None:
+            donations.append((L, req.mamba_ping_pong[1 - req.mamba_next_track_idx]))
+        if not donations:
+            return  # no ×64 boundary crossed this chunk; req keeps its pages (committed later)
+        dedup_len: int | None = None
+        for boundary, slot in donations:
+            clone = self._clone_slot_for_tree(slot)
+            prefix_len, mamba_exist = self.prefix_cache.insert(
+                _key_ids(req)[:boundary], page_indices[:boundary], clone)
+            _pfx(f"insert[chunk] L={boundary} -> prefix_len={prefix_len} mamba_exist={mamba_exist}")
+            if mamba_exist:
+                pool.free(clone)  # node already had a snapshot; clone unused
+            # Dedup floor: only the FIRST insert that created nodes reports pre-existing tree
+            # pages. The nodes it built for [prefix_len, boundary) own THIS request's pages, so
+            # a later, longer insert walks them and reports prefix_len >= boundary -- freeing
+            # against that would free the request's own pages from under the tree.
+            if dedup_len is None and prefix_len < boundary:
+                dedup_len = prefix_len
+        if dedup_len is None:
+            dedup_len = prefix_len  # every donated key pre-existed: the deepest match is the dup
+        top = donations[-1][0]
         self.unlock(old_handle)
-        self._free(page_indices[old_handle.cached_len : prefix_len])
+        self._free(page_indices[old_handle.cached_len : dedup_len])
         # Lock the committed snapshot node FIRST: the replacement-slot alloc below can trigger
         # evict_mamba (via ensure_mamba_slots), which would otherwise reclaim this still-unlocked
         # just-donated node -- freeing its KV pages under the still-decoding request.
-        m = self.prefix_cache.match_prefix(_key_ids(req)[:L])
+        m = self.prefix_cache.match_prefix(_key_ids(req)[:top])
         # Same re-point as the generic path: the dedup free above returned this request's own
-        # pages for [old_handle.cached_len, prefix_len) while its row still named them.
-        if prefix_len > old_handle.cached_len:
-            self.page_table[req.table_idx, old_handle.cached_len : prefix_len].copy_(
-                m.kv_indices[old_handle.cached_len : prefix_len])
+        # pages for [old_handle.cached_len, dedup_len) while its row still named them.
+        if dedup_len > old_handle.cached_len:
+            self.page_table[req.table_idx, old_handle.cached_len : dedup_len].copy_(
+                m.kv_indices[old_handle.cached_len : dedup_len])
         req.cache_handle = HybridCacheHandle(m.cached_len, m.node, m.kv_indices)
         self.lock(req.cache_handle)
-        # copy-on-donate: the tree holds a private clone and the request keeps `frozen`
-        # for its next track -- no replacement alloc, no shared ownership.
+        # copy-on-donate: the tree holds private clones and the request keeps both faces
+        # for its next tracks -- no replacement alloc, no shared ownership.
         req.mamba_last_track_seqlen = None
 
     def _cache_req_swa(self, req: Req, *, finished: bool) -> None:
