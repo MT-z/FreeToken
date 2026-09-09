@@ -141,22 +141,23 @@ class OffloadMoeCache:
     # pcie_bw / cpu_bw ratio so the PCIe fetch and the CPU overflow GEMV take equal
     # time (perfect overlap): fetched : cpu = pcie : cpu - pcie.
     hybrid_fetch_fraction: float = 0.0
+    # bank layout from the expert kernel (a BankSpec per role); when given it replaces the _BANK_SCHEMAS lookup and the slot cap comes from max_slots
+    layout: dict | None = None
+    max_slots: int | None = None
 
     def __post_init__(self) -> None:
         policy_ids = {"lru": 0}
         assert self.cache_policy in policy_ids
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
-        assert self.quant_format in _BANK_SCHEMAS, f"unknown quant_format {self.quant_format!r}"
+        if self.layout is None:
+            assert self.quant_format in _BANK_SCHEMAS, f"unknown quant_format {self.quant_format!r}"
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
         self.cpu_executor = None
         # MoE layer ids whose decode runs on the CPU executor; the rest use the GPU
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
-        # all layers = the plain --moe-backend cpu case).
+        # all layers = the plain --moe-strategy cpu case).
         self.cpu_layer_ids: frozenset = frozenset()
-        # Disk tier (None when off): a moe.disk_tier.DiskTier that fetches
-        # disk-resident slot-cache misses before the PCIe copy path.
-        self._disk_tier = None
         # num_experts floor + nvfp4_marlin slot cap, shared with the runtime-rebuild path.
         self.validate_rebuild(self.cache_size)
         assert not self.prefill_overlap or self.cache_size >= 2 * self.num_experts, (
@@ -202,7 +203,10 @@ class OffloadMoeCache:
         # carry independent host attributes -- see layer_residency) and their GPU
         # slot caches, keyed by the format's bank schema (attached by
         # set_bank_sources). The GPU slot cache stays one unified pool per bank.
-        self.bank_schema = _BANK_SCHEMAS[self.quant_format]
+        if self.layout is not None:
+            self.bank_schema = tuple(role for role, spec in self.layout.items() if not spec.resident)
+        else:
+            self.bank_schema = _BANK_SCHEMAS[self.quant_format]
         self.bank_sources: dict[str, list[torch.Tensor]] = {}
         self.bank_caches: dict[str, torch.Tensor] = {}
         # per-layer host residency: the GPU movement paths require "pinned"; LOCKED/PAGEABLE layers decode on the CPU executor and prefill via copy_missing's pageable branch
@@ -297,18 +301,22 @@ class OffloadMoeCache:
         per layer (independent allocations, so each layer can carry its own host
         attributes); each slot cache mirrors the bank's row shape and dtype as one
         unified GPU pool. The row layouts are produced by the weight loaders /
-        repackers (see ``_BANK_SCHEMAS`` and :mod:`freetoken.moe.nvfp4_backends`)
+        repackers (see ``_BANK_SCHEMAS`` and :mod:`freetoken.layers.quantization.moe.nvfp4`)
         -- the cache machinery is layout-agnostic and just moves rows.
 
         ``layer_residency`` labels each layer with a ``HostResidency`` value (default: all pinned).
         Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows, and their only movement is ``copy_missing``'s whole-layer pageable prefill branch -- which is why prefill overlap is incompatible with them.
         """
+        from freetoken.moe.legacy_format import canonical_role
         from freetoken.moe.host_banks import HostResidency
 
-        assert set(sources) == set(self.bank_schema), (
-            f"banks {sorted(sources)} do not match the {self.quant_format!r} "
-            f"schema {self.bank_schema}"
-        )
+        # loaders and FTW files may still name the banks the old way (gate_up_packed, ...)
+        by_role = {canonical_role(name): per_layer for name, per_layer in sources.items()}
+        if set(by_role) != {canonical_role(n) for n in self.bank_schema}:
+            raise AssertionError(
+                f"banks {sorted(sources)} do not match the {self.quant_format!r} schema {self.bank_schema}"
+            )
+        sources = {name: by_role[canonical_role(name)] for name in self.bank_schema}
         residency = layer_residency or [HostResidency.PINNED.value] * self.num_layers
         assert len(residency) == self.num_layers, (len(residency), self.num_layers)
         unpinned = frozenset(
@@ -332,6 +340,13 @@ class OffloadMoeCache:
             per_layer = sources[name]
             assert len(per_layer) == self.num_layers, (name, len(per_layer))
             head = per_layer[0]
+            if self.layout is not None:
+                spec = self.layout[name]
+                if tuple(head.shape[1:]) != tuple(spec.shape) or head.dtype != spec.dtype:
+                    raise ValueError(
+                        f"bank {name!r} rows are {tuple(head.shape[1:])} {head.dtype} but the expert kernel's layout "
+                        f"wants {tuple(spec.shape)} {spec.dtype}; the banks were packed for another kernel"
+                    )
             for layer_id, source in enumerate(per_layer):
                 assert source.is_contiguous(), f"bank {name!r} layer {layer_id} must be contiguous"
                 assert source.size(0) == self.num_experts, (name, layer_id, source.shape)
@@ -435,11 +450,16 @@ class OffloadMoeCache:
         """
         if cache_size < self.num_experts:
             raise ValueError(f"cache_size {cache_size} < num_experts {self.num_experts}")
-        if self.quant_format == "nvfp4_marlin" and cache_size > MARLIN_MAX_CACHE_SIZE:
+        if self.max_slots is not None and cache_size > self.max_slots:
+            raise ValueError(
+                f"moe_cache_size={cache_size} exceeds the expert kernel's slot limit of {self.max_slots}; "
+                f"pass --moe-cache-size {self.max_slots} or less, or let the default kernel serve the experts"
+            )
+        if self.layout is None and self.quant_format == "nvfp4_marlin" and cache_size > MARLIN_MAX_CACHE_SIZE:
             raise ValueError(
                 f"moe_cache_size={cache_size} exceeds the marlin backend's slot limit of "
                 f"{MARLIN_MAX_CACHE_SIZE} (vLLM moe_align_block_size caps padded experts at "
-                "1024); reduce moe_cache_size or force --nvfp4-backend triton"
+                "1024); reduce moe_cache_size or force --quant-backend moe.nvfp4=triton"
             )
 
     def rebuild(self, cache_size: int) -> None:
@@ -512,8 +532,6 @@ class OffloadMoeCache:
             self.prefill_overlap = False
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
-        if self._disk_tier is not None:
-            self._disk_tier.refresh(self)  # slot caches were reallocated
 
     def set_alphas(
         self, gate_up_alpha: torch.Tensor | None, down_alpha: torch.Tensor | None
@@ -855,19 +873,7 @@ class OffloadMoeCache:
             self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
         )
 
-    @property
-    def disk_tier_enabled(self) -> bool:
-        return self._disk_tier is not None
-
-    def materialize_layer(self, layer_id: int, expert_ids: torch.Tensor | None = None) -> None:
-        if self._disk_tier is not None:
-            # Disk tier: stream only the RAM-resident prefix, then fetch the routed
-            # disk-resident experts into their identity slots (needs the routing).
-            assert expert_ids is not None, "disk-tier prefill needs the routed expert ids"
-            self._pending_src_layer = layer_id
-            self._pending_whole_layer = True
-            self._disk_tier.materialize_layer(self, layer_id, expert_ids)
-            return
+    def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer
 
         self._pending_src_layer = layer_id
@@ -1002,25 +1008,11 @@ class OffloadMoeCache:
             "norm_entropy": norm_ent,
         }
 
-    def attach_disk_tier(self, index, ram_experts: int, workers: int = 8) -> None:
-        """Enable the NVMe tier: disk-resident slot-cache misses are fetched from the
-        original checkpoint before the PCIe copy path (see moe/disk_tier.py)."""
-        from freetoken.moe.disk_tier import DiskTier
-
-        assert self.decode_target == "gpu", "disk tier v0 supports the gpu (offload) path only"
-        assert self.quant_format == "nvfp4", f"disk tier v0 supports native nvfp4 banks (got {self.quant_format!r})"
-        assert not self.prefill_overlap, "disk tier v0 does not support prefill overlap"
-        self._disk_tier = DiskTier(index, self, ram_experts, workers=workers)
-
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
-        if self._disk_tier is not None:
-            # Fetch this layer's disk-resident misses into their slots, then shrink the
-            # miss list to the RAM-resident remainder for the PCIe copy below.
-            self._disk_tier.fetch_pending(self, layer_id)
-        elif layer_id in self._unpinned_layers:
+        if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
                 raise RuntimeError(
                     f"layer {layer_id} is unpinned: its only copy is the whole-layer "
@@ -1032,13 +1024,6 @@ class OffloadMoeCache:
             for per_layer, cache in self.banks:
                 cache[: self.num_experts].copy_(per_layer[layer_id])
             return
-        if (self._disk_tier is not None and layer_id == 0
-                and os.environ.get("FT_DISK_TIER_VERIFY")
-                and not torch.cuda.is_current_stream_capturing()):
-            print(f"[copy-miss] layer={layer_id} fused={self._copy_fused_ok} "
-                  f"n={int(self.num_indices.item())} "
-                  f"evict={self.evict_slots[:4].cpu().tolist()} "
-                  f"src={self.src_indices[:4].cpu().tolist()}", flush=True)
         if self._copy_fused_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
@@ -1054,33 +1039,22 @@ class OffloadMoeCache:
                 self.src_indices,
                 self.num_indices,
             )
-        else:
-            from freetoken.kernel import fast_index_copy_jit
+            return
 
-            for per_layer, cache in self.banks:
-                fast_index_copy_jit(
-                    cache,
-                    self.evict_slots,
-                    per_layer[layer_id],
-                    self.src_indices,
-                    self.num_indices,
-                )
-        if (self._disk_tier is not None and layer_id == 0
-                and self._pending_whole_layer
-                and os.environ.get("FT_DISK_TIER_VERIFY")):
-            self._disk_tier.verify_ram(self, layer_id)
+        from freetoken.kernel import fast_index_copy_jit
+
+        for per_layer, cache in self.banks:
+            fast_index_copy_jit(
+                cache,
+                self.evict_slots,
+                per_layer[layer_id],
+                self.src_indices,
+                self.num_indices,
+            )
 
 
 def iter_offload_moe_layers(model) -> Iterator:
     from freetoken.layers import BaseOP, OffloadMoELayer
-
-    # A model whose MoE blocks are bespoke nn.Modules (not OffloadMoELayer) declares its
-    # offload layers explicitly via this hook (e.g. DeepSeek-V4-Flash); attach_offload_moe_cache
-    # then sets .offload_cache on each yielded layer just like the OffloadMoELayer walk.
-    hook = getattr(model, "_iter_offload_moe_layers", None)
-    if hook is not None:
-        yield from hook()
-        return
 
     if isinstance(model, OffloadMoELayer):
         yield model

@@ -44,10 +44,12 @@ def test_loader_auto_admission_consumes_effective_memory(
     chosen = []
 
     def build(*args, **kwargs):
-        chosen.append(args[5])  # _build_expert_banks(..., parallel, ...)
+        # #418 split _build_expert_banks in two; method=None takes the legacy path,
+        # where `parallel` is still the 6th positional argument.
+        chosen.append(args[5])
         return expert_banks.ExpertBanks("bf16", {})
 
-    monkeypatch.setattr(expert_banks, "_build_expert_banks", build)
+    monkeypatch.setattr(expert_banks, "_legacy_expert_banks", build)
     config = SimpleNamespace(num_moe_layers=1, expert_quant="none")
 
     expert_banks.load_expert_banks(
@@ -76,7 +78,7 @@ def test_explicit_parallel_loader_override_bypasses_auto_admission(
         chosen.append(args[5])
         return expert_banks.ExpertBanks("bf16", {})
 
-    monkeypatch.setattr(expert_banks, "_build_expert_banks", build)
+    monkeypatch.setattr(expert_banks, "_legacy_expert_banks", build)
     config = SimpleNamespace(num_moe_layers=1, expert_quant="none")
 
     expert_banks.load_expert_banks(
