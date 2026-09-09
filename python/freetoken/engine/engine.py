@@ -1122,6 +1122,18 @@ class Engine:
                 "MoE cache worst layers: "
                 + ", ".join(f"L{L['layer']}={L['miss_rate']:.3f}" for L in worst)
             )
+        # The logged oracle_hit is one point on a curve: the bound at *this* cache size.
+        # What decides whether a smaller cache could still work is the whole curve, and the
+        # histogram it comes from is device-side and never leaves. FREETOKEN_MOE_FREQ_OUT
+        # writes it out (overwriting, so the last window holds the whole run) so the curve
+        # can be swept offline instead of by rebooting the serve once per cache size.
+        freq_out = os.environ.get("FREETOKEN_MOE_FREQ_OUT")
+        if freq_out:
+            torch.save({"decode_freq": cache.decode_freq.cpu(),
+                        "cache_size": cache.cache_size,
+                        "num_layers": cache.num_layers,
+                        "num_experts": cache.num_experts,
+                        "realized_hit": 1.0 - agg["miss_rate"]}, freq_out)
         routing = cache.decode_routing_stats()
         if routing:
             # oracle_hit_at_slots is the upper bound on hit rate for *any* policy with this
