@@ -237,10 +237,20 @@ class OffloadMoeCache:
         self.stat_active_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
         self.stat_fetched_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
         self.stat_steps_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
-        # Opt-in decode routing histogram (per layer, per expert) for cache-skew
-        # analysis. Accumulated in ``ensure_experts`` from the raw expert ids before the
-        # kernel rewrites them to slots. Only accurate with CUDA graphs disabled (the
-        # captured graph would not re-run this host-side scatter on replay).
+        # Opt-in routing histogram (per layer, per expert) for cache-skew analysis.
+        # Accumulated in ``ensure_experts`` from the raw expert ids before the kernel
+        # rewrites them to slots.
+        #
+        # ~~Only accurate with CUDA graphs disabled (the captured graph would not re-run this
+        # host-side scatter on replay).~~ Measured false, 2026-09-10: the scatter is a device
+        # op issued from Python, so capture records it and replay re-executes it. Graphs-on
+        # matched graphs-off to the token except the 1+2+4 = 7 capture forwards, 0.005% of
+        # 140,994 tokens. Believing the old note means collecting with graphs off, which
+        # measures a different system than the one that serves.
+        #
+        # Despite the name, this also gates the PREFILL counters (prefill_miss_freq,
+        # prefill_chunks). The name is upstream's and engine.py sets it from
+        # --moe-collect-stats; renaming it would diverge for no functional gain.
         self.collect_decode_freq = False
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device

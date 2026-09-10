@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import math
+import contextlib
 import os
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
@@ -1158,8 +1159,14 @@ class Engine:
             # torch.save raises RuntimeError, not OSError, when the parent directory is
             # missing, so OSError alone would have missed the likeliest typo (found by the
             # test, which is the whole reason it is here).
+            # Write beside the destination and rename. os.replace is atomic within a
+            # filesystem, so a reader never sees a half-written dump -- this file is
+            # overwritten every MOE_STATS_INTERVAL steps and is polled from outside while
+            # the serve runs, which is exactly the shape that produces torn reads.
+            tmp = f"{freq_out}.tmp"
             try:
-                torch.save(payload, freq_out)
+                torch.save(payload, tmp)
+                os.replace(tmp, freq_out)
             except (OSError, RuntimeError) as e:
                 # This runs inside the decode loop. An unwritable path is a typo in an env
                 # var, and killing a serve mid-run over an instrument is the wrong trade --
@@ -1171,6 +1178,8 @@ class Engine:
                     "the routing histogram will not be dumped for the rest of this run"
                 )
                 self._moe_freq_out_failed = True
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
         routing = cache.decode_routing_stats()
         if routing:
             # oracle_hit_at_slots is the upper bound on hit rate for *any* policy with this

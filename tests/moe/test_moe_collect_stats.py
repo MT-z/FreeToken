@@ -180,3 +180,39 @@ def test_a_writable_dump_path_still_writes(caplog, tmp_path):
     saved = torch.load(good)
     assert saved["cache_size"] == 6
     assert saved["decode_freq"].shape == (2, 4)
+
+
+def test_a_failed_write_does_not_destroy_the_previous_dump(caplog, tmp_path, monkeypatch):
+    """The dump is overwritten every MOE_STATS_INTERVAL steps and is polled from outside.
+
+    Writing straight to the destination opens and truncates it before serializing, so a
+    reader that arrives mid-write gets a truncated file and a writer that fails mid-write
+    leaves one. On 2026-09-10 three readers took three different token counts from one live
+    dump; the workaround lived in the consumer (copy on mtime change, re-check, hope). This
+    puts it in the writer: save beside the destination and os.replace, which is atomic within
+    a filesystem.
+    """
+    import torch
+
+    dest = tmp_path / "freq.pt"
+    _emit_with_dump(_DumpableCache(), caplog, dest)
+    first = torch.load(dest)
+    assert first["cache_size"] == 6
+
+    real_save = torch.save
+
+    def torn_save(obj, path, *a, **kw):
+        # Fails the way a real one does: the file is opened and partly written first.
+        open(path, "wb").write(b"\x80\x04partial")
+        raise RuntimeError("disk full")
+
+    caplog.clear()
+    monkeypatch.setattr(torch, "save", torn_save)
+    engine, out = _emit_with_dump(_DumpableCache(), caplog, dest)
+    monkeypatch.setattr(torch, "save", real_save)
+
+    assert "cannot be written" in out
+    assert engine._moe_freq_out_failed is True
+    # The point: the previous dump is still there and still loadable.
+    assert torch.load(dest)["cache_size"] == 6, "the failed write destroyed the last good dump"
+    assert not (tmp_path / "freq.pt.tmp").exists(), "left its scratch file behind"
