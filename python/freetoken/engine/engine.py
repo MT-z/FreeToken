@@ -1135,6 +1135,8 @@ class Engine:
             # lets the histogram be checked against the engine's own counter for this window.
             torch.save({"decode_freq": cache.decode_freq.cpu(),
                         "decode_miss_freq": cache.decode_miss_freq.cpu(),
+                        "prefill_miss_freq": cache.prefill_miss_freq.clone(),
+                        "prefill_chunks": cache.prefill_chunks,
                         "window_active": int(agg["layer_calls"] * agg["active_per_layer"]),
                         "window_missing": int(agg["layer_calls"] * agg["missing_per_layer"]),
                         "cache_size": cache.cache_size,

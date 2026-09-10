@@ -262,6 +262,17 @@ class OffloadMoeCache:
         self._miss_scratch = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
+        # Prefill counterpart. Every prefill chunk touches every expert of every layer
+        # (materialize_layer / the overlap prefetch stream whole layers), so what actually
+        # crosses the bus is the set that is NOT resident at chunk start -- and with a disk
+        # tier, the cold part of that set is what comes off SSD. The hit condition here is
+        # slot >= 2*num_experts, not >= 0: the prefill double buffer owns the slots below,
+        # and those bytes are volatile within a chunk (offload_kernels.py prefill_hit_compact).
+        # Host-side, once per chunk, off the captured path entirely -- prefill is not captured.
+        self.prefill_miss_freq = torch.zeros(
+            (self.num_layers, self.num_experts), dtype=torch.int64
+        )
+        self.prefill_chunks = 0
         # (per-layer sources, cache) per bank, in schema order. Every piece of cache
         # machinery that moves bank bytes (copy_missing, the prefill double buffers,
         # bank_views) iterates this list, so the slot cache is bank-count agnostic.
@@ -663,6 +674,11 @@ class OffloadMoeCache:
             with torch.cuda.stream(self.prefill_copy_stream):
                 self._prefill_slot_snapshot.copy_(self.slot_for_id, non_blocking=True)
             self.prefill_copy_stream.synchronize()
+            if self.collect_decode_freq:
+                self.prefill_miss_freq += (
+                    self._prefill_slot_snapshot < 2 * self.num_experts
+                ).to(self.prefill_miss_freq.dtype)
+                self.prefill_chunks += 1
 
     def prefetch_prefill_layer(self, layer_id: int) -> None:
         if not self.prefill_overlap or layer_id >= self.num_layers:
