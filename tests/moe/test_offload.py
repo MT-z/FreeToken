@@ -911,3 +911,37 @@ def test_rebuild_resets_the_miss_counters_with_decode_freq():
     assert cache.prefill_chunks == 0
     assert cache.prefill_hit_rows == 0
     assert cache.prefill_total_rows == 0
+
+
+def test_no_counter_takes_its_device_from_process_state():
+    """Every tensor the cache allocates must name its device, not inherit torch's default.
+
+    prefill_miss_freq did not (2026-09-10, found by review). It is accumulated against
+    _prefill_slot_snapshot, which is pinned host memory, so host is the right home for it --
+    but leaving that to the default made it the one tensor here whose device depends on
+    process state. Under torch.set_default_device("cuda") it would allocate on the GPU while
+    its accumulation partner stayed on the host, and the += in begin_prefill would raise at
+    serve time. Nothing in python/ sets a default device, so the defect was latent.
+
+    A CUDA fixture is not needed to catch it, and would not be enough anyway: the accumulation
+    is gated on device.type == "cuda", so a CPU-constructed cache can never reach it. What is
+    testable is the allocation. Setting the default to "meta" -- a device nothing here would
+    ever want -- makes any tensor that leaves the choice to torch land somewhere visible,
+    which covers tensors this test does not name yet.
+    """
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    torch.set_default_device("meta")
+    try:
+        cache = OffloadMoeCache(
+            num_layers=2, num_experts=4, cache_size=6, device=torch.device("cpu")
+        )
+    finally:
+        torch.set_default_device(None)
+
+    stray = sorted(
+        name
+        for name, value in vars(cache).items()
+        if torch.is_tensor(value) and value.device.type == "meta"
+    )
+    assert not stray, f"allocated on torch's default device instead of naming one: {stray}"

@@ -274,8 +274,16 @@ class OffloadMoeCache:
         # counter stays zero and does NOT mean "everything was resident". Without hit-d2d
         # prefill streams every expert regardless, so the quantity this measures does not
         # exist in that mode.
+        # device="cpu" deliberately, and explicitly: the accumulation partner is the PINNED
+        # HOST snapshot (_prefill_slot_snapshot, pin_memory=True), classified once per chunk
+        # off the captured path -- "pure host math", as begin_prefill says. Keeping the
+        # accumulator beside it avoids an H2D per chunk. Spelling it out matters because
+        # leaving it to torch's default made the only tensor here whose device depends on
+        # process state: under torch.set_default_device("cuda") it would land on the GPU while
+        # the snapshot stayed on the host, and the += at serve time would raise. Nothing in
+        # python/ sets that today, so this was latent, not live.
         self.prefill_miss_freq = torch.zeros(
-            (self.num_layers, self.num_experts), dtype=torch.int64
+            (self.num_layers, self.num_experts), dtype=torch.int64, device="cpu"
         )
         self.prefill_chunks = 0
         # (per-layer sources, cache) per bank, in schema order. Every piece of cache
