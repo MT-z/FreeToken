@@ -1137,6 +1137,13 @@ class Engine:
                         "decode_miss_freq": cache.decode_miss_freq.cpu(),
                         "prefill_miss_freq": cache.prefill_miss_freq.clone(),
                         "prefill_chunks": cache.prefill_chunks,
+                        # Accumulation check for prefill_miss_freq: prefill_hit_rows counts
+                        # hit_mask.sum() per layer per chunk at prefetch time, while
+                        # prefill_miss_freq classifies every layer from the chunk-start
+                        # snapshot. If the snapshot is frozen for the chunk as the comment at
+                        # offload_cache.py:279 claims, total - hit must equal the miss sum.
+                        "prefill_hit_rows": cache.prefill_hit_rows,
+                        "prefill_total_rows": cache.prefill_total_rows,
                         "window_active": int(agg["layer_calls"] * agg["active_per_layer"]),
                         "window_missing": int(agg["layer_calls"] * agg["missing_per_layer"]),
                         "cache_size": cache.cache_size,

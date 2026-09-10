@@ -269,6 +269,11 @@ class OffloadMoeCache:
         # slot >= 2*num_experts, not >= 0: the prefill double buffer owns the slots below,
         # and those bytes are volatile within a chunk (offload_kernels.py prefill_hit_compact).
         # Host-side, once per chunk, off the captured path entirely -- prefill is not captured.
+        # ** Only meaningful under --moe-prefill-hit-d2d. ** The accumulation sits inside the
+        # hit-d2d branch, because that is where the snapshot is taken; with hit-d2d off the
+        # counter stays zero and does NOT mean "everything was resident". Without hit-d2d
+        # prefill streams every expert regardless, so the quantity this measures does not
+        # exist in that mode.
         self.prefill_miss_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64
         )
