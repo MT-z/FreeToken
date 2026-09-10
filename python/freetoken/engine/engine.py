@@ -1129,7 +1129,14 @@ class Engine:
         # can be swept offline instead of by rebooting the serve once per cache size.
         freq_out = os.environ.get("FREETOKEN_MOE_FREQ_OUT")
         if freq_out:
+            # agg's active/missing come from lru_stats, which the kernel accumulates in its
+            # own launch and which _emit_moe_stats zeroes each report. They are an independent
+            # count of the same thing decode_miss_freq scatters per expert, so dumping both
+            # lets the histogram be checked against the engine's own counter for this window.
             torch.save({"decode_freq": cache.decode_freq.cpu(),
+                        "decode_miss_freq": cache.decode_miss_freq.cpu(),
+                        "window_active": int(agg["layer_calls"] * agg["active_per_layer"]),
+                        "window_missing": int(agg["layer_calls"] * agg["missing_per_layer"]),
                         "cache_size": cache.cache_size,
                         "num_layers": cache.num_layers,
                         "num_experts": cache.num_experts,

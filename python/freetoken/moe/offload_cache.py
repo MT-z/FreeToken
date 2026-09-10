@@ -245,6 +245,23 @@ class OffloadMoeCache:
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
+        # Companion to decode_freq: per (layer, expert), how many decode steps requested it
+        # while it was NOT resident in a slot -- i.e. how many times it was actually fetched.
+        # decode_freq counts routing picks; several picks in one step collapse to one fetch,
+        # and a pick to a resident expert costs no transfer at all, so the two are different
+        # quantities and only this one is proportional to bytes moved. Restricted to the cold
+        # set it is the SSD read count, which is what a disk tier's cost is made of.
+        #
+        # Fixed shape throughout (a scratch row, scatter_ with a scalar, one multiply-add), so
+        # it is CUDA-graph safe on the same terms as decode_freq -- measured 2026-09-10: with
+        # graphs on, decode_freq differs from the graphs-off run by exactly the 1+2+4 capture
+        # forwards and nothing else.
+        self.decode_miss_freq = torch.zeros(
+            (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
+        )
+        self._miss_scratch = torch.zeros(
+            (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
+        )
         # (per-layer sources, cache) per bank, in schema order. Every piece of cache
         # machinery that moves bank bytes (copy_missing, the prefill double buffers,
         # bank_views) iterates this list, so the slot cache is bank-count agnostic.
@@ -830,6 +847,13 @@ class OffloadMoeCache:
             # slot ids in place), so snapshot the routing histogram before that happens.
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+            # slot_for_id still holds this step's *incoming* residency (lru_ensure updates it
+            # below); -1 is the decode miss condition (offload_kernels.py:151 -- the >= 2E rule
+            # is prefill's, where the double buffer owns the low slots).
+            scratch = self._miss_scratch[layer_id]
+            scratch.zero_()
+            scratch.scatter_(0, ids, 1)          # 1 per distinct requested expert
+            self.decode_miss_freq[layer_id] += scratch * (self.slot_for_id[layer_id] < 0)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
@@ -849,6 +873,10 @@ class OffloadMoeCache:
         if self.collect_decode_freq:
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+            scratch = self._miss_scratch[layer_id]
+            scratch.zero_()
+            scratch.scatter_(0, ids, 1)
+            self.decode_miss_freq[layer_id] += scratch * (self.slot_for_id[layer_id] < 0)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts_hybrid(
