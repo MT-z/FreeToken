@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import math
 import contextlib
+import errno
 import os
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
@@ -371,6 +372,7 @@ class ForwardOutput(NamedTuple):
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
+        self.tp_info = config.tp_info
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _ensure_expandable_segments()  # before the first CUDA allocation below
 
@@ -1131,55 +1133,7 @@ class Engine:
         # histogram it comes from is device-side and never leaves. FREETOKEN_MOE_FREQ_OUT
         # writes it out (overwriting, so the last window holds the whole run) so the curve
         # can be swept offline instead of by rebooting the serve once per cache size.
-        freq_out = os.environ.get("FREETOKEN_MOE_FREQ_OUT")
-        if freq_out and not self._moe_freq_out_failed:
-            # agg's active/missing come from lru_stats, which the kernel accumulates in its
-            # own launch and which _emit_moe_stats zeroes each report. They are an independent
-            # count of the same thing decode_miss_freq scatters per expert, so dumping both
-            # lets the histogram be checked against the engine's own counter for this window.
-            payload = {"decode_freq": cache.decode_freq.cpu(),
-                        "decode_miss_freq": cache.decode_miss_freq.cpu(),
-                        "prefill_miss_freq": cache.prefill_miss_freq.cpu(),
-                        "prefill_chunks": cache.prefill_chunks,
-                        # Accumulation check for prefill_miss_freq: prefill_hit_rows counts
-                        # hit_mask.sum() per layer per chunk at prefetch time, while
-                        # prefill_miss_freq classifies every layer from the chunk-start
-                        # snapshot. If the snapshot is frozen for the chunk as the comment at
-                        # offload_cache.py:279 claims, total - hit must equal the miss sum.
-                        "prefill_hit_rows": cache.prefill_hit_rows,
-                        "prefill_total_rows": cache.prefill_total_rows,
-                        "window_active": int(agg["layer_calls"] * agg["active_per_layer"]),
-                        "window_missing": int(agg["layer_calls"] * agg["missing_per_layer"]),
-                        "cache_size": cache.cache_size,
-                        "num_layers": cache.num_layers,
-                        "num_experts": cache.num_experts,
-                        "realized_hit": 1.0 - agg["miss_rate"]}
-            # Only the write is guarded. The device reads above stay outside, so a CUDA
-            # error still surfaces as itself instead of being mistaken for a bad path --
-            # torch.save raises RuntimeError, not OSError, when the parent directory is
-            # missing, so OSError alone would have missed the likeliest typo (found by the
-            # test, which is the whole reason it is here).
-            # Write beside the destination and rename. os.replace is atomic within a
-            # filesystem, so a reader never sees a half-written dump -- this file is
-            # overwritten every MOE_STATS_INTERVAL steps and is polled from outside while
-            # the serve runs, which is exactly the shape that produces torn reads.
-            tmp = f"{freq_out}.tmp"
-            try:
-                torch.save(payload, tmp)
-                os.replace(tmp, freq_out)
-            except (OSError, RuntimeError) as e:
-                # This runs inside the decode loop. An unwritable path is a typo in an env
-                # var, and killing a serve mid-run over an instrument is the wrong trade --
-                # the instrument is optional, the serve is not. Warn once, stop trying, and
-                # let decode carry on; the absence of dumps is the signal, and it is loud
-                # because the first thing anyone does with this variable is look for the file.
-                logger.warning(
-                    f"FREETOKEN_MOE_FREQ_OUT={freq_out!r} cannot be written ({e}); "
-                    "the routing histogram will not be dumped for the rest of this run"
-                )
-                self._moe_freq_out_failed = True
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp)
+        self._dump_routing_histogram(cache)
         routing = cache.decode_routing_stats()
         if routing:
             # oracle_hit_at_slots is the upper bound on hit rate for *any* policy with this
@@ -1198,6 +1152,37 @@ class Engine:
                 f"norm_entropy={routing['norm_entropy']:.3f}"
             )
         cache.reset_stats()
+
+    def _dump_routing_histogram(self, cache) -> None:
+        """FREETOKEN_MOE_FREQ_OUT: the whole-run histogram, so the cache-size curve can be
+        swept offline instead of by rebooting the serve once per size.
+
+        Rank 0 only, and via a pid-suffixed temp file, because both the destination and the
+        temp name are shared by every rank otherwise.
+        """
+        freq_out = os.environ.get("FREETOKEN_MOE_FREQ_OUT")
+        if not freq_out or self._moe_freq_out_failed or not self.tp_info.is_primary():
+            return
+        payload = cache.routing_histogram()
+        tmp = f"{freq_out}.tmp.{os.getpid()}"
+        try:
+            torch.save(payload, tmp)
+            os.replace(tmp, freq_out)
+        except (OSError, RuntimeError) as e:
+            # Runs in the decode loop, so it must not take the serve with it. Latch only on
+            # errors a retry cannot fix; ENOSPC and EIO are how a healthy path fails once,
+            # and latching on those would end collection for a multi-hour run over a
+            # transient. The device reads are outside the try, so a CUDA error stays itself.
+            permanent = getattr(e, "errno", None) in (
+                errno.ENOENT, errno.EACCES, errno.EISDIR, errno.ENOTDIR, errno.EROFS
+            ) or isinstance(e, RuntimeError)
+            logger.warning_rank0(
+                f"FREETOKEN_MOE_FREQ_OUT={freq_out!r} cannot be written ({e})"
+                + ("; giving up for this run" if permanent else "; will retry next report")
+            )
+            self._moe_freq_out_failed = permanent
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:

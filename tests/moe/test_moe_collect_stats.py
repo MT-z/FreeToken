@@ -8,7 +8,9 @@ the command line or read them back. These tests cover that wiring -- the flag re
 
 import contextlib
 import io
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
+
+import pytest
 
 from freetoken.engine.engine import MOE_STATS_INTERVAL, Engine
 from freetoken.server.args import ServerArgs, parse_args
@@ -71,10 +73,34 @@ class _StubCache:
         self.reset_calls += 1
 
 
+@pytest.fixture(autouse=True)
+def _no_inherited_dump_path(monkeypatch):
+    """The emit path reads FREETOKEN_MOE_FREQ_OUT, and a histogram sweep leaves it exported.
+
+    Without this the suite passes in a clean shell and fails in the one where this branch is
+    actually used, which reads as a code regression rather than as leakage.
+    """
+    monkeypatch.delenv("FREETOKEN_MOE_FREQ_OUT", raising=False)
+
+
+def _engine_stub(cache):
+    """Just enough Engine for _emit_moe_stats, with the dump path bound from the real class.
+
+    Binding rather than re-declaring is the point: a stub that reimplements the engine side
+    keeps passing while production changes underneath it.
+    """
+    from freetoken.distributed import DistributedInfo
+
+    engine = SimpleNamespace(moe_offload_cache=cache, _emit_moe_stats=None,
+                             _moe_freq_out_failed=False,
+                             tp_info=DistributedInfo(rank=0, size=1))
+    engine._dump_routing_histogram = MethodType(Engine._dump_routing_histogram, engine)
+    return engine
+
+
 def _emit(cache, caplog):
-    engine = SimpleNamespace(moe_offload_cache=cache, _emit_moe_stats=None)
     with caplog.at_level("INFO"):
-        Engine._emit_moe_stats(engine)
+        Engine._emit_moe_stats(_engine_stub(cache))
     return "\n".join(r.getMessage() for r in caplog.records)
 
 
@@ -110,43 +136,46 @@ def test_interval_is_a_sane_window():
 
 
 class _DumpableCache(_StubCache):
-    """_StubCache plus the tensors FREETOKEN_MOE_FREQ_OUT reads."""
+    """_StubCache plus the fields routing_histogram reads, and the real method bound.
+
+    The payload is assembled by production, not restated here: if the cache grows a field the
+    dump needs, this fails loudly on the missing attribute instead of quietly writing a file
+    that no longer matches what the engine writes.
+    """
 
     def __init__(self, **kw):
         import torch
 
+        from freetoken.moe.offload_cache import OffloadMoeCache
+
         super().__init__(**kw)
-        self.decode_freq = torch.zeros((2, 4), dtype=torch.int64)
-        self.decode_miss_freq = torch.zeros((2, 4), dtype=torch.int64)
-        self.prefill_miss_freq = torch.zeros((2, 4), dtype=torch.int64)
-        self.prefill_chunks = 0
-        self.prefill_hit_rows = 0
-        self.prefill_total_rows = 0
-        self.cache_size = 6
-        self.num_layers = 2
-        self.num_experts = 4
+        self.num_layers, self.num_experts, self.cache_size = 2, 4, 6
+        # Distinct per tensor so a swapped key in the payload cannot pass.
+        self.decode_freq = torch.full((2, 4), 7, dtype=torch.int64)
+        self.decode_miss_freq = torch.full((2, 4), 3, dtype=torch.int64)
+        self.prefill_miss_freq = torch.full((2, 4), 5, dtype=torch.int64)
+        self.prefill_chunks = 11
+        self.prefill_hit_rows = 13
+        self.prefill_total_rows = 17
+        self.lru_stats = torch.tensor([[19, 23, 29]], dtype=torch.int64)
+        self.cpu_layer_ids = frozenset()
+        self._prefill_hit_d2d_active = True
+        self.routing_histogram = MethodType(OffloadMoeCache.routing_histogram, self)
 
 
-def _emit_with_dump(cache, caplog, path, engine=None):
-    import os
-
-    engine = engine or SimpleNamespace(
-        moe_offload_cache=cache, _emit_moe_stats=None, _moe_freq_out_failed=False
-    )
-    old = os.environ.get("FREETOKEN_MOE_FREQ_OUT")
-    os.environ["FREETOKEN_MOE_FREQ_OUT"] = str(path)
-    try:
-        with caplog.at_level("INFO"):
-            Engine._emit_moe_stats(engine)
-    finally:
-        if old is None:
-            os.environ.pop("FREETOKEN_MOE_FREQ_OUT", None)
-        else:
-            os.environ["FREETOKEN_MOE_FREQ_OUT"] = old
+def _emit_with_dump(cache, caplog, path, monkeypatch, engine=None):
+    if engine is None:
+        engine = _engine_stub(cache)
+    else:
+        engine.moe_offload_cache = cache
+        engine._dump_routing_histogram = MethodType(Engine._dump_routing_histogram, engine)
+    monkeypatch.setenv("FREETOKEN_MOE_FREQ_OUT", str(path))
+    with caplog.at_level("INFO"):
+        Engine._emit_moe_stats(engine)
     return engine, "\n".join(r.getMessage() for r in caplog.records)
 
 
-def test_an_unwritable_dump_path_warns_once_and_does_not_stop_decode(caplog, tmp_path):
+def test_an_unwritable_dump_path_warns_once_and_does_not_stop_decode(caplog, tmp_path, monkeypatch):
     """The dump runs inside the decode loop, so it must not be able to kill a serve.
 
     An unwritable FREETOKEN_MOE_FREQ_OUT is a typo in an env var. Before this was handled,
@@ -155,7 +184,7 @@ def test_an_unwritable_dump_path_warns_once_and_does_not_stop_decode(caplog, tmp
     rather than every 256 decode steps.
     """
     bad = tmp_path / "no-such-dir" / "freq.pt"  # parent does not exist
-    engine, out = _emit_with_dump(_DumpableCache(), caplog, bad)
+    engine, out = _emit_with_dump(_DumpableCache(), caplog, bad, monkeypatch)
 
     # The report itself still came out: decode was not interrupted.
     assert "miss_rate=0.250" in out
@@ -164,22 +193,30 @@ def test_an_unwritable_dump_path_warns_once_and_does_not_stop_decode(caplog, tmp
     assert not bad.exists()
 
     caplog.clear()
-    _, out2 = _emit_with_dump(_DumpableCache(), caplog, bad, engine=engine)
+    _, out2 = _emit_with_dump(_DumpableCache(), caplog, bad, monkeypatch, engine=engine)
     assert "miss_rate=0.250" in out2, "the report must keep coming"
     assert "cannot be written" not in out2, "warned twice; it should latch"
 
 
-def test_a_writable_dump_path_still_writes(caplog, tmp_path):
+def test_a_writable_dump_path_still_writes(caplog, tmp_path, monkeypatch):
     """The guard must not have turned the instrument off for everyone."""
     import torch
 
     good = tmp_path / "freq.pt"
-    engine, _ = _emit_with_dump(_DumpableCache(), caplog, good)
+    engine, _ = _emit_with_dump(_DumpableCache(), caplog, good, monkeypatch)
     assert good.exists()
     assert engine._moe_freq_out_failed is False
     saved = torch.load(good)
-    assert saved["cache_size"] == 6
-    assert saved["decode_freq"].shape == (2, 4)
+    # Distinguishable values per tensor: a swapped key or an inverted ratio has to show up.
+    assert int(saved["decode_freq"][0, 0]) == 7
+    assert int(saved["decode_miss_freq"][0, 0]) == 3
+    assert int(saved["prefill_miss_freq"][0, 0]) == 5
+    assert (saved["window_active"], saved["window_missing"]) == (19, 23)
+    assert saved["prefill_hit_rows_window"] == 13 and saved["prefill_total_rows_window"] == 17
+    assert saved["decode_target"] == "gpu" and saved["prefill_hit_d2d_active"] is True
+    assert saved["decode_counted_layers"] == [0, 1]
+    assert not (tmp_path / "freq.pt.tmp").exists()
+    assert not list(tmp_path.glob("freq.pt.tmp.*")), "left its scratch file behind"
 
 
 def test_a_failed_write_does_not_destroy_the_previous_dump(caplog, tmp_path, monkeypatch):
@@ -195,7 +232,7 @@ def test_a_failed_write_does_not_destroy_the_previous_dump(caplog, tmp_path, mon
     import torch
 
     dest = tmp_path / "freq.pt"
-    _emit_with_dump(_DumpableCache(), caplog, dest)
+    _emit_with_dump(_DumpableCache(), caplog, dest, monkeypatch)
     first = torch.load(dest)
     assert first["cache_size"] == 6
 
@@ -208,11 +245,47 @@ def test_a_failed_write_does_not_destroy_the_previous_dump(caplog, tmp_path, mon
 
     caplog.clear()
     monkeypatch.setattr(torch, "save", torn_save)
-    engine, out = _emit_with_dump(_DumpableCache(), caplog, dest)
+    engine, out = _emit_with_dump(_DumpableCache(), caplog, dest, monkeypatch)
     monkeypatch.setattr(torch, "save", real_save)
 
     assert "cannot be written" in out
     assert engine._moe_freq_out_failed is True
     # The point: the previous dump is still there and still loadable.
     assert torch.load(dest)["cache_size"] == 6, "the failed write destroyed the last good dump"
-    assert not (tmp_path / "freq.pt.tmp").exists(), "left its scratch file behind"
+    assert not list(tmp_path.glob("freq.pt.tmp.*")), "left its scratch file behind"
+
+
+def test_the_payload_is_a_snapshot_not_a_live_view():
+    """prefill_miss_freq lives on the host, where .cpu() returns the tensor itself.
+
+    The other two histograms are CUDA and .cpu() copies them, so the asymmetry is invisible at
+    the call site -- and the payload exists precisely to freeze what gets serialized.
+    """
+    import torch
+
+    cache = _DumpableCache()
+    payload = cache.routing_histogram()
+    before = payload["prefill_miss_freq"].clone()
+
+    cache.prefill_miss_freq += 100
+
+    assert torch.equal(payload["prefill_miss_freq"], before), "the payload aliases the counter"
+
+
+def test_only_rank_zero_writes_the_dump(caplog, tmp_path, monkeypatch):
+    """One Engine per TP rank, one FREETOKEN_MOE_FREQ_OUT between them.
+
+    Without a gate every rank writes the same destination through the same temp name, which
+    is exactly what the temp-and-rename was added to prevent.
+    """
+    from freetoken.distributed import DistributedInfo
+
+    dest = tmp_path / "freq.pt"
+    engine = _engine_stub(_DumpableCache())
+    engine.tp_info = DistributedInfo(rank=1, size=2)
+    _emit_with_dump(_DumpableCache(), caplog, dest, monkeypatch, engine=engine)
+    assert not dest.exists(), "a non-primary rank wrote the dump"
+
+    engine.tp_info = DistributedInfo(rank=0, size=2)
+    _emit_with_dump(_DumpableCache(), caplog, dest, monkeypatch, engine=engine)
+    assert dest.exists(), "rank 0 must still write it"

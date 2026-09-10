@@ -945,3 +945,101 @@ def test_no_counter_takes_its_device_from_process_state():
         if torch.is_tensor(value) and value.device.type == "meta"
     )
     assert not stray, f"allocated on torch's default device instead of naming one: {stray}"
+
+
+def test_count_routing_separates_picks_from_fetches():
+    """decode_freq counts picks, decode_miss_freq counts transfers. The whole branch is this.
+
+    Two picks of the same expert in one step are one fetch, and a pick to a resident expert is
+    none -- which is why decode_miss_freq and not decode_freq is proportional to bytes. Nothing
+    asserted that. Three mutations used to survive the suite: scatter_ -> scatter_add_ (which
+    collapses the distinction), the prefill hit rule 2*E -> 0, and deleting the call outright.
+    """
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=6, device=torch.device("cpu")
+    )
+    cache.collect_decode_freq = True
+    # expert 1 resident in slot 3, expert 3 in slot 0; 0 and 2 are not.
+    cache.slot_for_id[0] = torch.tensor([-1, 3, -1, 0], dtype=cache.slot_for_id.dtype)
+
+    cache._count_routing(0, torch.tensor([0, 0, 1, 2], dtype=torch.int32))
+
+    assert cache.decode_freq[0].tolist() == [2, 1, 1, 0], "picks: expert 0 was chosen twice"
+    assert cache.decode_miss_freq[0].tolist() == [1, 0, 1, 0], (
+        "fetches: 0 and 2 were absent (once each, not twice for 0); 1 was resident"
+    )
+    assert cache.decode_freq[1].sum() == 0, "another layer's row must not move"
+
+    # Second step, same routing, expert 0 now resident: a pick, not a fetch.
+    cache.slot_for_id[0, 0] = 5
+    cache._count_routing(0, torch.tensor([0, 0, 1, 2], dtype=torch.int32))
+    assert cache.decode_freq[0].tolist() == [4, 2, 2, 0]
+    assert cache.decode_miss_freq[0].tolist() == [1, 0, 2, 0], "a resident pick moves nothing"
+
+    assert (cache.decode_miss_freq <= cache.decode_freq).all(), "miss > pick is impossible"
+
+    # NOT covered here: the prefill side's own hit rule (snapshot < 2*num_experts). Its
+    # accumulation is gated on device.type == "cuda", so a CPU cache cannot reach it and
+    # flipping the threshold to < 0 still passes this suite. It is checked end-to-end instead,
+    # by freetoken-systest tools/prefill-identity.py against the engine's own row counters.
+
+
+def test_reset_clears_the_routing_histogram(monkeypatch):
+    """reset() is called by warmup and by graph capture to undo their synthetic residency.
+
+    It did not clear the counters, so that traffic stayed in the histogram for the whole run --
+    on a config where _warmup_prefill fires, two all-miss prefill chunks in every cell before
+    any real request, pulling exactly the skew the instrument measures toward uniform.
+
+    reset_cache is a CUDA kernel, so it is stubbed; what is under test is the wiring.
+    """
+    from freetoken.moe import offload_kernels
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    monkeypatch.setattr(offload_kernels, "reset_cache", lambda cache: None)
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=6, device=torch.device("cpu")
+    )
+    cache.decode_freq += 7
+    cache.decode_miss_freq += 3
+    cache.prefill_miss_freq += 5
+    cache.prefill_chunks = 11
+
+    cache.reset()
+
+    assert int(cache.decode_freq.sum()) == 0
+    assert int(cache.decode_miss_freq.sum()) == 0
+    assert int(cache.prefill_miss_freq.sum()) == 0
+    assert cache.prefill_chunks == 0
+
+
+def test_ensure_experts_actually_calls_the_counter(monkeypatch):
+    """The counting is only as good as the call site; deleting it used to pass everything.
+
+    ensure_experts' kernel is CUDA, so it is stubbed -- what is under test is that the wiring
+    from ensure_experts / ensure_experts_hybrid to _count_routing is still there, and that it
+    runs BEFORE the kernel (which rewrites expert_ids into slots in place).
+    """
+    from freetoken.moe import offload_kernels
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    seen = []
+
+    def fake(cache, layer_id, expert_ids, *a, **kw):
+        # By now the counters must already have moved, or the ids they read were slots.
+        seen.append(int(cache.decode_freq.sum()))
+
+    monkeypatch.setattr(offload_kernels, "ensure_experts", fake)
+    monkeypatch.setattr(offload_kernels, "ensure_experts_hybrid", fake)
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=6, device=torch.device("cpu")
+    )
+    cache.collect_decode_freq = True
+
+    cache.ensure_experts(0, torch.tensor([0, 1], dtype=torch.int32))
+    assert seen == [2], "counted after the kernel, or not at all"
+
+    cache.ensure_experts_hybrid(1, torch.tensor([2, 3], dtype=torch.int32))
+    assert seen == [2, 4], "the hybrid call site does not count"
