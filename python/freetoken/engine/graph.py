@@ -204,6 +204,13 @@ class GraphRunner:
             else batch.size
         )
         batch.padded_reqs = batch.reqs + [self.dummy_req] * (padded_size - batch.size)
+        # Tell the routing counters how many of those rows are real. This is the one place
+        # that knows both numbers, and it runs host-side before the replay, so the value is
+        # in place when the captured graph reads it. Guarded: the copy is a host->device
+        # write per decode step and buys nothing when nothing is counting.
+        cache = self.moe_offload_cache
+        if cache is not None and cache.collect_decode_freq:
+            cache._real_rows.fill_(batch.size)
 
     # NOTE: This must be called before freeing NCCL resources to prevent program hang
     def destroy_cuda_graphs(self) -> None:

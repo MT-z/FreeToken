@@ -257,6 +257,33 @@ class OffloadMoeCache:
         self._miss_scratch = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
+        # The same two counters restricted to REAL rows. pad_batch appends dummy_req rows to
+        # reach a captured graph size and their picks land in decode_freq like any other -- a
+        # batch of 3 into the bs=4 graph makes exactly 25% of counted picks synthetic
+        # (measured: token inflation 1.3333 at concurrency 3). Both are kept, not one, because
+        # their difference is checkable: it must equal dummy_rows * top_k exactly, which no
+        # cross-run comparison can establish (graphs off changes the kernels and the greedy
+        # output with them -- 3,412 of 10,240 cells moved the wrong way when that was tried).
+        # One extra column is the sentinel every masked-out pick is sent to, so the mask needs
+        # no bounds-checked scatter.
+        self.decode_freq_real = torch.zeros(
+            (self.num_layers, self.num_experts + 1), dtype=torch.int64, device=self.device
+        )
+        self.decode_miss_freq_real = torch.zeros(
+            (self.num_layers, self.num_experts + 1), dtype=torch.int64, device=self.device
+        )
+        self._miss_scratch_real = torch.zeros(
+            (self.num_layers, self.num_experts + 1), dtype=torch.int64, device=self.device
+        )
+        # How many rows of the decode batch are real. Written host-side before replay (see
+        # GraphRunner.pad_batch) and read device-side inside the captured graph, so the mask
+        # rides the graph without baking a batch size into it. The default masks nothing, so a
+        # caller that never sets it gets the old behaviour rather than empty counters.
+        self._real_rows = torch.full((), 1 << 30, dtype=torch.int32, device=self.device)
+        self._row_index = torch.arange(1024, dtype=torch.int32, device=self.device)
+        self._sentinel_id = torch.tensor(
+            self.num_experts, dtype=torch.int64, device=self.device
+        )
         # Prefill counterpart: experts not resident at chunk start, which is what crosses the
         # bus since a chunk touches every expert. Hit is slot >= 2*num_experts, not >= 0 --
         # the double buffer owns the slots below and its bytes are volatile within the chunk.
@@ -876,11 +903,30 @@ class OffloadMoeCache:
         Fixed shape throughout, so it is CUDA-graph safe on the same terms as decode_freq.
         """
         ids = expert_ids.reshape(-1).long()
-        self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+        ones = torch.ones_like(ids)
+        self.decode_freq[layer_id].scatter_add_(0, ids, ones)
         scratch = self._miss_scratch[layer_id]
         scratch.zero_()
         scratch.scatter_(0, ids, 1)  # 1 per distinct requested expert, not per pick
-        self.decode_miss_freq[layer_id] += scratch * (self.slot_for_id[layer_id] < 0)
+        missing = self.slot_for_id[layer_id] < 0
+        self.decode_miss_freq[layer_id] += scratch * missing
+
+        # The same two, with pad_batch's dummy rows sent to the sentinel column instead. Rows
+        # are the batch dimension, so the mask is per row and broadcasts over top_k.
+        # Rows are the batch dimension: decode passes [padded_batch, top_k]. Built from
+        # shape[0] and numel rather than expand_as so a 1-D expert_ids (one entry per row)
+        # is masked the same way instead of raising.
+        nrow = expert_ids.shape[0]
+        rows = self._row_index[:nrow].unsqueeze(1)
+        real = (rows < self._real_rows).expand(nrow, ids.numel() // nrow).reshape(-1)
+        ids_real = torch.where(real, ids, self._sentinel_id)
+        self.decode_freq_real[layer_id].scatter_add_(0, ids_real, ones)
+        scratch_r = self._miss_scratch_real[layer_id]
+        scratch_r.zero_()
+        scratch_r.scatter_(0, ids_real, 1)
+        self.decode_miss_freq_real[layer_id][: self.num_experts] += (
+            scratch_r[: self.num_experts] * missing
+        )
 
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
@@ -964,6 +1010,12 @@ class OffloadMoeCache:
         return {
             "decode_freq": self.decode_freq.cpu(),
             "decode_miss_freq": self.decode_miss_freq.cpu(),
+            # The same two counting only real rows; the sentinel column (index num_experts)
+            # holds what pad_batch's dummy rows contributed, so the contamination is readable
+            # from one dump instead of inferred from two runs.
+            "decode_freq_real": self.decode_freq_real[:, : self.num_experts].cpu(),
+            "decode_miss_freq_real": self.decode_miss_freq_real[:, : self.num_experts].cpu(),
+            "decode_freq_padrows": self.decode_freq_real[:, self.num_experts].cpu(),
             # .clone(), not .cpu(): this one is already on the host, where .cpu() returns the
             # live accumulator rather than a copy.
             "prefill_miss_freq": self.prefill_miss_freq.clone(),
@@ -1004,6 +1056,8 @@ class OffloadMoeCache:
         """
         self.decode_freq.zero_()
         self.decode_miss_freq.zero_()
+        self.decode_freq_real.zero_()
+        self.decode_miss_freq_real.zero_()
         self.prefill_miss_freq.zero_()
         self.prefill_chunks = 0
 

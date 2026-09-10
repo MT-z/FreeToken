@@ -1126,3 +1126,57 @@ def test_window_totals_follow_the_decode_target():
 
     assert build("gpu").window_totals() == (4, 6, 10)  # lru_stats.sum(0) over 2 layers
     assert build("hybrid").window_totals() == (7, 11, 13)
+
+
+def test_real_row_counters_exclude_the_padded_rows():
+    """pad_batch's dummy rows are counted; the _real pair is the same counters without them.
+
+    A batch of 3 into the bs=4 graph makes exactly one row in four synthetic, and those picks
+    land in decode_freq like any other. Keeping BOTH counters is what makes the contamination
+    checkable from a single run: their difference must equal the padded rows' picks exactly,
+    which no two-run comparison can establish (turning graphs off to remove the padding also
+    changes the kernels, and with them the greedy output).
+    """
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=8, cache_size=8, device=torch.device("cpu")
+    )
+    # 4 rows of 2 picks; rows 0-2 are real, row 3 is pad_batch's dummy.
+    ids = torch.tensor([[0, 1], [1, 2], [2, 3], [6, 7]], dtype=torch.int32)
+    cache._real_rows.fill_(3)
+    cache._count_routing(0, ids)
+
+    assert cache.decode_freq[0].tolist() == [1, 2, 2, 1, 0, 0, 1, 1]
+    # The dummy row's two picks are gone from the real counter and sit in the sentinel column.
+    assert cache.decode_freq_real[0][:8].tolist() == [1, 2, 2, 1, 0, 0, 0, 0]
+    assert int(cache.decode_freq_real[0][8]) == 2
+
+    # The identity the whole design rests on: the gap IS the padded rows' picks.
+    gap = int(cache.decode_freq.sum()) - int(cache.decode_freq_real[0][:8].sum())
+    assert gap == 2, "the two counters differ by something other than the padded rows"
+
+    # And with nothing padded, the two counters agree exactly.
+    cache.reset_routing_freq()
+    cache._real_rows.fill_(4)
+    cache._count_routing(0, ids)
+    assert cache.decode_freq[0].tolist() == cache.decode_freq_real[0][:8].tolist()
+    assert int(cache.decode_freq_real[0][8]) == 0
+
+
+def test_real_rows_defaults_to_masking_nothing():
+    """A caller that never sets _real_rows must get the old behaviour, not empty counters.
+
+    Only GraphRunner.pad_batch sets it, and only while collecting; every other path -- unit
+    tests, a rebuild, an eager forward that skipped pad_batch -- would otherwise silently
+    produce a histogram of zeros that looks like "no traffic".
+    """
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=8, cache_size=8, device=torch.device("cpu")
+    )
+    ids = torch.tensor([[0, 1], [6, 7]], dtype=torch.int32)
+    cache._count_routing(0, ids)  # _real_rows untouched
+    assert cache.decode_freq[0].tolist() == cache.decode_freq_real[0][:8].tolist()
+    assert int(cache.decode_freq_real[0][8]) == 0

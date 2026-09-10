@@ -154,6 +154,9 @@ class _DumpableCache(_StubCache):
         self.decode_freq = torch.full((2, 4), 7, dtype=torch.int64)
         self.decode_miss_freq = torch.full((2, 4), 3, dtype=torch.int64)
         self.prefill_miss_freq = torch.full((2, 4), 5, dtype=torch.int64)
+        # The real-rows pair, one column wider: the last column is the pad-row sentinel.
+        self.decode_freq_real = torch.full((2, 5), 6, dtype=torch.int64)
+        self.decode_miss_freq_real = torch.full((2, 5), 2, dtype=torch.int64)
         self.prefill_chunks = 11
         self.prefill_hit_rows = 13
         self.prefill_total_rows = 17
