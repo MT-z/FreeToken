@@ -533,6 +533,12 @@ class OffloadMoeCache:
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
         self.decode_freq.zero_()
+        # Same generation as decode_freq: a rebuild changes cache_size, so miss counts taken
+        # under the old size cannot be mixed with picks taken under the new one -- that
+        # produces miss > pick and wrong per-token costs. Reset together or not at all.
+        self.decode_miss_freq.zero_()
+        self.prefill_miss_freq.zero_()
+        self.prefill_chunks = 0
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable

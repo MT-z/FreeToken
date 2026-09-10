@@ -868,3 +868,46 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
         with hb.PinPipeline() as pins:
             pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+
+def test_rebuild_resets_the_miss_counters_with_decode_freq():
+    """A rebuild resizes the slot cache, so miss counts taken under the old size cannot be
+    mixed with picks taken under the new one.
+
+    ``decode_freq`` was already reset here; ``decode_miss_freq`` / ``prefill_miss_freq`` /
+    ``prefill_chunks`` were added later and were left accumulating across the resize
+    (external review, 2026-09-10). The visible damage is arithmetic: the placement cost
+    function divides misses by picks, and a stale numerator over a fresh denominator gives
+    miss > pick -- a per-token transfer cost larger than the number of routing decisions
+    that could have caused one. They are one generation; reset together or not at all.
+    """
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=4,
+        cache_size=6,
+        device=torch.device("cpu"),
+    )
+    cache.set_bank_sources(
+        {
+            "gate_up": [torch.randn(4, 32, 8), torch.randn(4, 32, 8)],
+            "down": [torch.randn(4, 8, 16), torch.randn(4, 8, 16)],
+        }
+    )
+    cache.decode_freq += 7
+    cache.decode_miss_freq += 3
+    cache.prefill_miss_freq += 5
+    cache.prefill_chunks = 11
+    cache.prefill_hit_rows = 13
+    cache.prefill_total_rows = 17
+
+    cache.rebuild(5)
+
+    # decode_freq is the reference: whatever it does, the miss counters do too.
+    assert int(cache.decode_freq.sum()) == 0
+    assert int(cache.decode_miss_freq.sum()) == 0, "stale misses over fresh picks -> miss > pick"
+    assert int(cache.prefill_miss_freq.sum()) == 0
+    assert cache.prefill_chunks == 0
+    assert cache.prefill_hit_rows == 0
+    assert cache.prefill_total_rows == 0
