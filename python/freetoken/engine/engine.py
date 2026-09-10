@@ -410,6 +410,9 @@ class Engine:
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
         self._moe_stats_step = 0
+        # Set once FREETOKEN_MOE_FREQ_OUT has failed to write, so the warning is one line and
+        # not one per report. Never reset: the path does not become writable mid-run.
+        self._moe_freq_out_failed = False
         self.cpu_moe_executor = None
         # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
@@ -1128,12 +1131,12 @@ class Engine:
         # writes it out (overwriting, so the last window holds the whole run) so the curve
         # can be swept offline instead of by rebooting the serve once per cache size.
         freq_out = os.environ.get("FREETOKEN_MOE_FREQ_OUT")
-        if freq_out:
+        if freq_out and not self._moe_freq_out_failed:
             # agg's active/missing come from lru_stats, which the kernel accumulates in its
             # own launch and which _emit_moe_stats zeroes each report. They are an independent
             # count of the same thing decode_miss_freq scatters per expert, so dumping both
             # lets the histogram be checked against the engine's own counter for this window.
-            torch.save({"decode_freq": cache.decode_freq.cpu(),
+            payload = {"decode_freq": cache.decode_freq.cpu(),
                         "decode_miss_freq": cache.decode_miss_freq.cpu(),
                         "prefill_miss_freq": cache.prefill_miss_freq.cpu(),
                         "prefill_chunks": cache.prefill_chunks,
@@ -1149,7 +1152,25 @@ class Engine:
                         "cache_size": cache.cache_size,
                         "num_layers": cache.num_layers,
                         "num_experts": cache.num_experts,
-                        "realized_hit": 1.0 - agg["miss_rate"]}, freq_out)
+                        "realized_hit": 1.0 - agg["miss_rate"]}
+            # Only the write is guarded. The device reads above stay outside, so a CUDA
+            # error still surfaces as itself instead of being mistaken for a bad path --
+            # torch.save raises RuntimeError, not OSError, when the parent directory is
+            # missing, so OSError alone would have missed the likeliest typo (found by the
+            # test, which is the whole reason it is here).
+            try:
+                torch.save(payload, freq_out)
+            except (OSError, RuntimeError) as e:
+                # This runs inside the decode loop. An unwritable path is a typo in an env
+                # var, and killing a serve mid-run over an instrument is the wrong trade --
+                # the instrument is optional, the serve is not. Warn once, stop trying, and
+                # let decode carry on; the absence of dumps is the signal, and it is loud
+                # because the first thing anyone does with this variable is look for the file.
+                logger.warning(
+                    f"FREETOKEN_MOE_FREQ_OUT={freq_out!r} cannot be written ({e}); "
+                    "the routing histogram will not be dumped for the rest of this run"
+                )
+                self._moe_freq_out_failed = True
         routing = cache.decode_routing_stats()
         if routing:
             # oracle_hit_at_slots is the upper bound on hit rate for *any* policy with this

@@ -107,3 +107,76 @@ def test_idle_window_emits_nothing_and_keeps_counters(caplog):
 
 def test_interval_is_a_sane_window():
     assert MOE_STATS_INTERVAL >= 1
+
+
+class _DumpableCache(_StubCache):
+    """_StubCache plus the tensors FREETOKEN_MOE_FREQ_OUT reads."""
+
+    def __init__(self, **kw):
+        import torch
+
+        super().__init__(**kw)
+        self.decode_freq = torch.zeros((2, 4), dtype=torch.int64)
+        self.decode_miss_freq = torch.zeros((2, 4), dtype=torch.int64)
+        self.prefill_miss_freq = torch.zeros((2, 4), dtype=torch.int64)
+        self.prefill_chunks = 0
+        self.prefill_hit_rows = 0
+        self.prefill_total_rows = 0
+        self.cache_size = 6
+        self.num_layers = 2
+        self.num_experts = 4
+
+
+def _emit_with_dump(cache, caplog, path, engine=None):
+    import os
+
+    engine = engine or SimpleNamespace(
+        moe_offload_cache=cache, _emit_moe_stats=None, _moe_freq_out_failed=False
+    )
+    old = os.environ.get("FREETOKEN_MOE_FREQ_OUT")
+    os.environ["FREETOKEN_MOE_FREQ_OUT"] = str(path)
+    try:
+        with caplog.at_level("INFO"):
+            Engine._emit_moe_stats(engine)
+    finally:
+        if old is None:
+            os.environ.pop("FREETOKEN_MOE_FREQ_OUT", None)
+        else:
+            os.environ["FREETOKEN_MOE_FREQ_OUT"] = old
+    return engine, "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_an_unwritable_dump_path_warns_once_and_does_not_stop_decode(caplog, tmp_path):
+    """The dump runs inside the decode loop, so it must not be able to kill a serve.
+
+    An unwritable FREETOKEN_MOE_FREQ_OUT is a typo in an env var. Before this was handled,
+    torch.save raised out of _emit_moe_stats and took the serve with it -- the instrument
+    killing the thing it was measuring. It must warn and carry on instead, and warn once
+    rather than every 256 decode steps.
+    """
+    bad = tmp_path / "no-such-dir" / "freq.pt"  # parent does not exist
+    engine, out = _emit_with_dump(_DumpableCache(), caplog, bad)
+
+    # The report itself still came out: decode was not interrupted.
+    assert "miss_rate=0.250" in out
+    assert "cannot be written" in out
+    assert engine._moe_freq_out_failed is True
+    assert not bad.exists()
+
+    caplog.clear()
+    _, out2 = _emit_with_dump(_DumpableCache(), caplog, bad, engine=engine)
+    assert "miss_rate=0.250" in out2, "the report must keep coming"
+    assert "cannot be written" not in out2, "warned twice; it should latch"
+
+
+def test_a_writable_dump_path_still_writes(caplog, tmp_path):
+    """The guard must not have turned the instrument off for everyone."""
+    import torch
+
+    good = tmp_path / "freq.pt"
+    engine, _ = _emit_with_dump(_DumpableCache(), caplog, good)
+    assert good.exists()
+    assert engine._moe_freq_out_failed is False
+    saved = torch.load(good)
+    assert saved["cache_size"] == 6
+    assert saved["decode_freq"].shape == (2, 4)

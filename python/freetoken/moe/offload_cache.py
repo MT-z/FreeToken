@@ -874,21 +874,41 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
+    def _count_routing(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        """Accumulate this step's picks and misses for ``layer_id``. Call BEFORE the kernel.
+
+        Two things have to be true at the call site and neither is checked here, because
+        checking would cost a sync on the captured path:
+
+        * ``expert_ids`` still holds raw expert ids. The kernel rewrites them to slot ids in
+          place, so after it runs this counts slots.
+        * ``slot_for_id`` still holds the step's *incoming* residency, which is what makes a
+          miss a miss. ``lru_ensure`` updates it.
+
+        ``-1`` is the decode miss condition (offload_kernels.py:151). The ``>= 2E`` rule is
+        prefill's, where the double buffer owns the low slots.
+
+        decode_freq counts picks; several picks in one step collapse to one fetch and a pick
+        to a resident expert moves nothing, so decode_miss_freq is the one proportional to
+        bytes. Verified against the engine's own lru_stats counter, which is accumulated
+        inside the kernel launch and shares no code with this: delta decode_miss_freq.sum()
+        == window_missing exactly, in all 211 windows of five runs at four coverages
+        (freetoken-systest results/20260910-merge-427.txt lists the runs).
+
+        Fixed shape throughout, so it is CUDA-graph safe on the same terms as decode_freq.
+        """
+        ids = expert_ids.reshape(-1).long()
+        self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+        scratch = self._miss_scratch[layer_id]
+        scratch.zero_()
+        scratch.scatter_(0, ids, 1)  # 1 per distinct requested expert, not per pick
+        self.decode_miss_freq[layer_id] += scratch * (self.slot_for_id[layer_id] < 0)
+
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
 
         if self.collect_decode_freq:
-            # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
-            # slot ids in place), so snapshot the routing histogram before that happens.
-            ids = expert_ids.reshape(-1).long()
-            self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
-            # slot_for_id still holds this step's *incoming* residency (lru_ensure updates it
-            # below); -1 is the decode miss condition (offload_kernels.py:151 -- the >= 2E rule
-            # is prefill's, where the double buffer owns the low slots).
-            scratch = self._miss_scratch[layer_id]
-            scratch.zero_()
-            scratch.scatter_(0, ids, 1)          # 1 per distinct requested expert
-            self.decode_miss_freq[layer_id] += scratch * (self.slot_for_id[layer_id] < 0)
+            self._count_routing(layer_id, expert_ids)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
@@ -906,12 +926,7 @@ class OffloadMoeCache:
         from freetoken.moe.offload_kernels import ensure_experts_hybrid
 
         if self.collect_decode_freq:
-            ids = expert_ids.reshape(-1).long()
-            self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
-            scratch = self._miss_scratch[layer_id]
-            scratch.zero_()
-            scratch.scatter_(0, ids, 1)
-            self.decode_miss_freq[layer_id] += scratch * (self.slot_for_id[layer_id] < 0)
+            self._count_routing(layer_id, expert_ids)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts_hybrid(
