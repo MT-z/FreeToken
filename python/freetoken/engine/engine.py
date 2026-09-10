@@ -1173,9 +1173,22 @@ class Engine:
             # errors a retry cannot fix; ENOSPC and EIO are how a healthy path fails once,
             # and latching on those would end collection for a multi-hour run over a
             # transient. The device reads are outside the try, so a CUDA error stays itself.
-            permanent = getattr(e, "errno", None) in (
-                errno.ENOENT, errno.EACCES, errno.EISDIR, errno.ENOTDIR, errno.EROFS
-            ) or isinstance(e, RuntimeError)
+            #
+            # Permanence is a property of the DESTINATION, not of the exception type. The
+            # earlier version read `or isinstance(e, RuntimeError)`, which contradicted the
+            # paragraph above: torch.save reports a missing parent directory and a failed
+            # write with the same RuntimeError, so one full disk ended collection for the
+            # rest of the run. Ask the directory instead -- a typo in the env var still fails
+            # every time, a full or flaky one is retried at the next report.
+            dest_dir = os.path.dirname(freq_out) or "."
+            permanent = (
+                getattr(e, "errno", None) in (
+                    errno.ENOENT, errno.EACCES, errno.EISDIR, errno.ENOTDIR, errno.EROFS
+                )
+                or not os.path.isdir(dest_dir)
+                or not os.access(dest_dir, os.W_OK | os.X_OK)
+                or os.path.isdir(freq_out)
+            )
             logger.warning_rank0(
                 f"FREETOKEN_MOE_FREQ_OUT={freq_out!r} cannot be written ({e})"
                 + ("; giving up for this run" if permanent else "; will retry next report")

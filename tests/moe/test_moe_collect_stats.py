@@ -160,7 +160,12 @@ class _DumpableCache(_StubCache):
         self.lru_stats = torch.tensor([[19, 23, 29]], dtype=torch.int64)
         self.cpu_layer_ids = frozenset()
         self._prefill_hit_d2d_active = True
+        # stat_* so the hybrid branch of window_totals has something real to read.
+        self.stat_active = torch.tensor(31, dtype=torch.int64)
+        self.stat_missing = torch.tensor(37, dtype=torch.int64)
+        self.stat_calls = torch.tensor(41, dtype=torch.int64)
         self.routing_histogram = MethodType(OffloadMoeCache.routing_histogram, self)
+        self.window_totals = MethodType(OffloadMoeCache.window_totals, self)
 
 
 def _emit_with_dump(cache, caplog, path, monkeypatch, engine=None):
@@ -249,10 +254,66 @@ def test_a_failed_write_does_not_destroy_the_previous_dump(caplog, tmp_path, mon
     monkeypatch.setattr(torch, "save", real_save)
 
     assert "cannot be written" in out
-    assert engine._moe_freq_out_failed is True
-    # The point: the previous dump is still there and still loadable.
+    # The previous dump is still there and still loadable.
     assert torch.load(dest)["cache_size"] == 6, "the failed write destroyed the last good dump"
     assert not list(tmp_path.glob("freq.pt.tmp.*")), "left its scratch file behind"
+
+    # A full disk is not a typo. This assertion used to read `is True` -- the test pinned the
+    # very behaviour the source comment says it avoids, because permanence was decided from
+    # the exception type and torch.save reports both with RuntimeError.
+    assert engine._moe_freq_out_failed is False, "one full disk ended collection for the run"
+    assert "will retry next report" in out
+
+
+def test_a_transient_write_failure_recovers_at_the_next_report(caplog, tmp_path, monkeypatch):
+    """The consequence of not latching: collection resumes on its own.
+
+    A multi-hour run is the case that matters -- the dump is the whole deliverable, and a
+    single ENOSPC must not leave it frozen at an hours-old snapshot.
+    """
+    import torch
+
+    dest = tmp_path / "freq.pt"
+    real_save = torch.save
+
+    def full_disk(obj, path, *a, **kw):
+        raise RuntimeError("No space left on device")
+
+    monkeypatch.setattr(torch, "save", full_disk)
+    engine, _ = _emit_with_dump(_DumpableCache(), caplog, dest, monkeypatch)
+    assert not dest.exists()
+    assert engine._moe_freq_out_failed is False
+
+    monkeypatch.setattr(torch, "save", real_save)
+    caplog.clear()
+    _, out = _emit_with_dump(_DumpableCache(), caplog, dest, monkeypatch, engine=engine)
+    assert dest.exists(), "the dump never came back after the disk was freed"
+    assert torch.load(dest)["cache_size"] == 6
+    assert "cannot be written" not in out
+
+
+def test_hybrid_window_totals_reach_the_dump(caplog, tmp_path, monkeypatch):
+    """ensure_experts_hybrid runs a different kernel and never writes lru_stats.
+
+    Reading lru_stats unconditionally made the dump's window totals three zeros on hybrid,
+    beside a log line that showed misses -- and decode_target in the payload could not
+    recover them, because the values themselves were gone. Both now go through window_totals.
+    """
+    import torch
+
+    dest = tmp_path / "freq.pt"
+    cache = _DumpableCache(decode_target="hybrid")
+    # lru_stats holds the gpu-path numbers; the hybrid path's live in stat_*.
+    _emit_with_dump(cache, caplog, dest, monkeypatch)
+    payload = torch.load(dest)
+    assert (payload["window_active"], payload["window_missing"],
+            payload["window_layer_calls"]) == (31, 37, 41)
+    assert payload["window_missing"] != 23, "read lru_stats, which hybrid never writes"
+
+    caplog.clear()
+    gpu = _DumpableCache(decode_target="gpu")
+    _emit_with_dump(gpu, caplog, dest, monkeypatch)
+    assert torch.load(dest)["window_missing"] == 23, "the gpu path must still read lru_stats"
 
 
 def test_the_payload_is_a_snapshot_not_a_live_view():

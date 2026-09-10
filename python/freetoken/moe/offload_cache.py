@@ -935,8 +935,13 @@ class OffloadMoeCache:
 
         reset_cache(self)
         # Callers (warmup, graph capture) reset residency so their synthetic traffic does not
-        # count; the histogram has to follow or that traffic stays in it forever.
+        # count; BOTH counter generations have to follow, or the first snapshot after a reset
+        # reports a histogram holding only real traffic beside window totals that still hold
+        # warmup -- and the miss identity (delta decode_miss_freq.sum() == window_missing)
+        # fails on exactly that window. reset_stats alone is the every-report case; reset is
+        # the "this traffic never happened" case and needs both.
         self.reset_routing_freq()
+        self.reset_stats()
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
@@ -955,7 +960,7 @@ class OffloadMoeCache:
         the file without them -- see decode_miss_freq's definition for the hybrid caveat, and
         prefill_miss_freq's for what a zero means with hit-d2d off.
         """
-        active, missing, calls = (int(x) for x in self.lru_stats.sum(0))
+        active, missing, calls = self.window_totals()
         return {
             "decode_freq": self.decode_freq.cpu(),
             "decode_miss_freq": self.decode_miss_freq.cpu(),
@@ -965,9 +970,11 @@ class OffloadMoeCache:
             "prefill_chunks": self.prefill_chunks,
             "prefill_hit_rows_window": self.prefill_hit_rows,
             "prefill_total_rows_window": self.prefill_total_rows,
-            # Straight off lru_stats. The engine's report divides these by calls; multiplying
-            # the ratio back and truncating loses a whole unit for most layer counts (exact
-            # at 40x256 only because 10240 = 5*2^11).
+            # Straight off window_totals, the same getter the log line uses, so the two
+            # cannot end up reading different counters (hybrid writes stat_*, not lru_stats).
+            # The engine's report divides these by calls; multiplying the ratio back and
+            # truncating loses a whole unit for most layer counts (exact at 40x256 only
+            # because 10240 = 5*2^11).
             "window_active": active,
             "window_missing": missing,
             "window_layer_calls": calls,
@@ -1037,13 +1044,24 @@ class OffloadMoeCache:
         self.stat_active_layer[layer_id] += active
         self.stat_steps_layer[layer_id] += 1
 
-    def decode_miss_stats(self) -> dict:
+    def window_totals(self) -> tuple[int, int, int]:
+        """``(active, missing, layer_calls)`` for the current window, from whichever counters
+        this decode target actually writes.
+
+        ``ensure_experts`` accumulates into ``lru_stats`` inside its own launch, but
+        ``ensure_experts_hybrid`` runs a different kernel and never touches it -- the hybrid
+        path's totals live in ``stat_active``/``stat_missing``/``stat_calls``, written by
+        ``record_decode_stats_hybrid``. Reading ``lru_stats`` unconditionally is therefore
+        three zeros on hybrid, next to a log line that shows misses. This exists so the log
+        and the dump cannot disagree about which counters the window is in: both call it.
+        """
         if self.decode_target == "hybrid":
-            active = int(self.stat_active.item())
-            missing = int(self.stat_missing.item())
-            calls = int(self.stat_calls.item())
-        else:
-            active, missing, calls = (int(x) for x in self.lru_stats.sum(0))
+            return (int(self.stat_active.item()), int(self.stat_missing.item()),
+                    int(self.stat_calls.item()))
+        return tuple(int(x) for x in self.lru_stats.sum(0))
+
+    def decode_miss_stats(self) -> dict:
+        active, missing, calls = self.window_totals()
         fetched = int(self.stat_fetched.item())
         return {
             "layer_calls": calls,

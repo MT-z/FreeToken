@@ -1043,3 +1043,86 @@ def test_ensure_experts_actually_calls_the_counter(monkeypatch):
 
     cache.ensure_experts_hybrid(1, torch.tensor([2, 3], dtype=torch.int32))
     assert seen == [2, 4], "the hybrid call site does not count"
+
+
+def test_reset_clears_both_counter_generations(monkeypatch):
+    """``reset()`` means "this traffic never happened", and that has to cover both.
+
+    Its callers are warmup and CUDA-graph capture (engine/graph.py), which reset residency
+    precisely so their synthetic traffic does not count. It cleared the run-cumulative
+    histogram and left the window counters (``lru_stats``, ``prefill_hit_rows`` /
+    ``prefill_total_rows``, ``stat_*``) holding that same traffic -- so the first snapshot
+    after startup carried a histogram of real picks beside window totals that still included
+    warmup, and the identity ``delta decode_miss_freq.sum() == window_missing`` failed on
+    exactly that window (external review, 2026-09-11). The end-to-end check that verified the
+    identity over 211 windows could not see it: it reads dumps that already exist on disk, so
+    the contaminated first window was never in the sample.
+
+    ``reset_stats`` stays the every-report case and must NOT touch the histogram -- that
+    direction is covered by test_reset_clears_the_routing_histogram's sibling.
+    """
+    from freetoken.moe import offload_kernels
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    # reset() delegates residency to a Triton kernel, which needs a live driver; the change
+    # under test is the Python either side of it. Stubbing the kernel keeps this a CPU test
+    # and keeps it honest about what it covers -- residency reset is not asserted here.
+    monkeypatch.setattr(offload_kernels, "reset_cache", lambda cache: None)
+
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=6, device=torch.device("cpu")
+    )
+    cache.set_bank_sources(
+        {
+            "gate_up": [torch.randn(4, 32, 8), torch.randn(4, 32, 8)],
+            "down": [torch.randn(4, 8, 16), torch.randn(4, 8, 16)],
+        }
+    )
+    cache.decode_freq += 7
+    cache.decode_miss_freq += 3
+    cache.prefill_miss_freq += 5
+    cache.prefill_chunks = 11
+    # The window generation, which reset() used to leave behind.
+    cache.lru_stats += 19
+    cache.prefill_hit_rows = 13
+    cache.prefill_total_rows = 17
+    cache.stat_missing += 23
+    cache.stat_active += 29
+    cache.stat_calls += 31
+
+    cache.reset()
+
+    assert int(cache.decode_freq.sum()) == 0
+    assert int(cache.decode_miss_freq.sum()) == 0
+    assert int(cache.prefill_miss_freq.sum()) == 0
+    assert cache.prefill_chunks == 0
+    assert int(cache.lru_stats.sum()) == 0, "window totals survived a reset"
+    assert cache.prefill_hit_rows == 0 and cache.prefill_total_rows == 0
+    assert int(cache.stat_missing.sum()) == 0, "hybrid window totals survived a reset"
+    assert int(cache.stat_active.sum()) == 0
+    assert int(cache.stat_calls.sum()) == 0
+
+
+def test_window_totals_follow_the_decode_target():
+    """``ensure_experts_hybrid`` runs a different kernel and never writes ``lru_stats``.
+
+    The log line branched on ``decode_target`` and the dump did not, so a hybrid run wrote
+    three zeros into the snapshot beside a log line showing misses -- and ``decode_target``
+    in the payload could not recover them, because the values were gone. One getter now, and
+    both callers use it.
+    """
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    def build(target):
+        c = OffloadMoeCache(
+            num_layers=2, num_experts=4, cache_size=6, device=torch.device("cpu"),
+            decode_target=target,
+        )
+        c.lru_stats += torch.tensor([[2, 3, 5]], dtype=torch.int64)
+        c.stat_active += 7
+        c.stat_missing += 11
+        c.stat_calls += 13
+        return c
+
+    assert build("gpu").window_totals() == (4, 6, 10)  # lru_stats.sum(0) over 2 layers
+    assert build("hybrid").window_totals() == (7, 11, 13)
