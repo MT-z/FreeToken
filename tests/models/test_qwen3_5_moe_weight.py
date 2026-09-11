@@ -607,3 +607,55 @@ def test_a_missing_weight_is_still_an_error(tmp_path):
     del raw[f"{LM}.layers.0.mlp.shared_expert.gate_proj.weight"]
     with pytest.raises(ValueError, match=r"missing tensors of .*shared_expert\.gate_up_proj"):
         _load(_write(tmp_path, moe, qcfg, raw))
+
+
+def _with_vision(folder: str) -> None:
+    """Give the written checkpoint a vision_config, so parse_config builds a tower."""
+    import os
+
+    p = os.path.join(folder, "config.json")
+    with open(p) as fh:
+        cfg = json.load(fh)
+    cfg["vision_config"] = {
+        "hidden_size": H, "depth": 1, "num_heads": QH, "intermediate_size": I, "patch_size": 16,
+    }
+    with open(p, "w") as fh:
+        json.dump(cfg, fh)
+
+
+def test_the_tower_loads_under_the_gate_unchanged(tmp_path, monkeypatch):
+    """The tower is bf16 with no scales and must come through the dense pass as stored.
+
+    Both shapes of leaf are here: qkv, which is not in _LINEAR_LEAVES so the reader never looks
+    at it, and down_proj, which is -- and which therefore does reach the reader. It survives
+    because the checkpoint's quant config does not cover visual.*, so the module reads as
+    unquantized and its single weight completes at once. An explicit bypass was written for
+    this case and then removed: no mutation of it failed, so it was guarding nothing.
+    """
+    moe, qcfg, raw = _layout("modelopt_mixed")
+    raw["model.visual.blocks.0.mlp.down_proj.weight"] = _bf16(H, I)
+    raw["model.visual.blocks.0.attn.qkv.weight"] = _bf16(3 * H, H)
+    folder = _write(tmp_path, moe, qcfg, raw)
+    _with_vision(folder)
+    monkeypatch.setenv("FREETOKEN_LOAD_VISION", "1")
+
+    loaded = _load(folder)
+
+    for leaf in ("blocks.0.mlp.down_proj.weight", "blocks.0.attn.qkv.weight"):
+        assert f"visual.{leaf}" in loaded, leaf
+        assert _same(loaded[f"visual.{leaf}"], raw["model.visual." + leaf]), f"{leaf} was transformed"
+    # The text tower's own down_proj still went through the reader and came out fused.
+    assert "model.layers.0.mlp.shared_expert.gate_up_proj.weight" in loaded
+
+
+def test_the_tower_is_dropped_when_the_gate_is_not_set(tmp_path, monkeypatch):
+    """The default. 0.8 GiB of bf16 that text-only serving never reads (models/config.py)."""
+    moe, qcfg, raw = _layout("modelopt_mixed")
+    raw["model.visual.blocks.0.mlp.down_proj.weight"] = _bf16(H, I)
+    folder = _write(tmp_path, moe, qcfg, raw)
+    _with_vision(folder)
+    monkeypatch.delenv("FREETOKEN_LOAD_VISION", raising=False)
+
+    loaded = _load(folder)
+
+    assert not any(k.startswith("visual.") for k in loaded)
