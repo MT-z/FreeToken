@@ -95,10 +95,7 @@ def _select_expert_source_spec(model_path: str) -> Nvfp4ExpertSourceSpec:
 _KDA_IN_PROJ = ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj")
 
 
-def load_nvfp4_expert_sources(model_path: str, config, *, layer_sink=None, disk_tier=None):
-    # disk_tier is threaded through the same way qwen3_5_moe does it: the caller builds the
-    # NVMe tier and every NVFP4 family's loader has to pass it down, or the tail of the bank
-    # is never registered and load fails with an unexpected-kwarg TypeError.
+def load_nvfp4_expert_sources(model_path: str, config, layer_sink=None):
     return load_nvfp4_expert_source_banks(
         model_path,
         config,
@@ -106,7 +103,6 @@ def load_nvfp4_expert_sources(model_path: str, config, *, layer_sink=None, disk_
         drop_page_cache=drop_page_cache,
         primary=get_tp_info().is_primary(),
         layer_sink=layer_sink,
-        disk_tier=disk_tier,
     )
 
 
