@@ -281,7 +281,18 @@ def test_iter_weights_bf16_matches_model_state_dict(tmp_path, monkeypatch):
     from freetoken.models.muse_glimmer.model import MuseGlimmerForCausalLM
     from freetoken.models.muse_glimmer.weight import iter_weights
 
+    # Toy dimensions, like the nvfp4 test below. At the real ones (hidden 6656, intermediate
+    # 19968, vocab 202048) the two embedding matrices alone are 5.4 GiB and the fixture is
+    # 8.7 GiB per run, which pytest then keeps for three runs. Nothing here reads a dimension:
+    # the assertions are the key set, that each shape matches the model's own, and the order
+    # of the qkvg concatenation.
     hf = _hf_config(num_layers=4)
+    text = hf.text_config
+    # head_dim stays one of rotary.py's supported sizes (64/128/256/512): unlike the nvfp4
+    # test below, this one builds the model, so the rope tables are constructed.
+    text.hidden_size, text.intermediate_size = 256, 384
+    text.num_attention_heads, text.num_key_value_heads, text.head_dim = 4, 2, 64
+    text.vocab_size = 512
     tensors = _bf16_checkpoint_tensors(hf)
     _write_shards(tmp_path, {"model-00001-of-00001.safetensors": tensors})
     import freetoken.models.muse_glimmer.weight as w
@@ -304,6 +315,13 @@ def test_iter_weights_bf16_matches_model_state_dict(tmp_path, monkeypatch):
     assert torch.equal(fused[:q_dim], tensors[p + "q_proj.weight"])
     assert torch.equal(fused[q_dim : q_dim + kv_dim], tensors[p + "k_proj.weight"])
     assert torch.equal(fused[-q_dim:], tensors[p + "gate_proj.weight"])
+    # ... and [gate, up] for the SwiGLU pair. Nothing checked this order: swapping it in
+    # _FUSIONS left every test in this file passing, at the old fixture size as at this one.
+    fused_mlp = loaded["model.layers.0.mlp.gate_up_proj.weight"]
+    m = "model.language_model.layers.0.mlp."
+    i_dim = tensors[m + "gate_proj.weight"].shape[0]
+    assert torch.equal(fused_mlp[:i_dim], tensors[m + "gate_proj.weight"])
+    assert torch.equal(fused_mlp[i_dim:], tensors[m + "up_proj.weight"])
 
 
 def test_iter_weights_nvfp4_cross_shard_scales(tmp_path, monkeypatch):
