@@ -209,8 +209,11 @@ class GraphRunner:
         # in place when the captured graph reads it. Guarded: the copy is a host->device
         # write per decode step and buys nothing when nothing is counting.
         cache = self.moe_offload_cache
-        if cache is not None and cache.collect_decode_freq:
+        if cache is not None and cache.collect_decode_freq and batch.is_decode:
             cache._real_rows.fill_(batch.size)
+            # The token denominator, from the one place that knows the real batch size. Only
+            # decode: prefill never reaches _count_routing (it goes through materialize_layer).
+            cache.decode_tokens += batch.size
 
     # NOTE: This must be called before freeing NCCL resources to prevent program hang
     def destroy_cuda_graphs(self) -> None:

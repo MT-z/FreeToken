@@ -280,6 +280,11 @@ class OffloadMoeCache:
         # rides the graph without baking a batch size into it. The default masks nothing, so a
         # caller that never sets it gets the old behaviour rather than empty counters.
         self._real_rows = torch.full((), 1 << 30, dtype=torch.int32, device=self.device)
+        # Real decode tokens this run, summed host-side from the same place that knows the
+        # real row count. The placement objective needs a token denominator, and deriving it
+        # as decode_freq.sum() // (num_layers * top_k) both hardcodes top_k in the consumer
+        # and counts pad_batch's rows as tokens. Counted, not derived.
+        self.decode_tokens = 0
         self._row_index = torch.arange(1024, dtype=torch.int32, device=self.device)
         self._sentinel_id = torch.tensor(
             self.num_experts, dtype=torch.int64, device=self.device
@@ -1031,6 +1036,9 @@ class OffloadMoeCache:
             "decode_freq_real": self.decode_freq_real[:, : self.num_experts].cpu(),
             "decode_miss_freq_real": self.decode_miss_freq_real[:, : self.num_experts].cpu(),
             "decode_freq_padrows": self.decode_freq_real[:, self.num_experts].cpu(),
+            # Real decode tokens, counted rather than reconstructed from a top_k the reader
+            # would have to know. Run-cumulative, like the histograms.
+            "decode_tokens": self.decode_tokens,
             # .clone(), not .cpu(): this one is already on the host, where .cpu() returns the
             # live accumulator rather than a copy.
             "prefill_miss_freq": self.prefill_miss_freq.clone(),
@@ -1073,6 +1081,7 @@ class OffloadMoeCache:
         self.decode_miss_freq.zero_()
         self.decode_freq_real.zero_()
         self.decode_miss_freq_real.zero_()
+        self.decode_tokens = 0
         self.prefill_miss_freq.zero_()
         self.prefill_chunks = 0
 
