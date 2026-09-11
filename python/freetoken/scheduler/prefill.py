@@ -73,6 +73,13 @@ class PrefillAdder:
             div_ceil(total_len, page_size) - div_ceil(cached_len, page_size)
         ) * page_size
 
+    def _kv_reservation_size(self, total_len: int, cached_len: int) -> int:
+        """Return the token-equivalent cost of the additional KV pages for a request."""
+        page_size = self.cache_manager.page_size
+        return (
+            div_ceil(total_len, page_size) - div_ceil(cached_len, page_size)
+        ) * page_size
+
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
             return None
