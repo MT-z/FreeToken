@@ -47,6 +47,10 @@ _LINEAR_LEAVES = frozenset({
 })
 # activation scales of modules whose scheme carries no input_scale role
 _DROPPED_SUFFIXES = frozenset({"input_scale", "input_global_scale"})
+# Roles a W4A16 export legitimately does not store. The dequant-side activation scale exists
+# only in a W4A4 checkpoint and no W4A16 kernel reads it (quantization/linear/nvfp4.py), so a
+# scheme that declares it must not make an older NVFP4 export unloadable: default the identity.
+_OPTIONAL_ROLES = {"input_scale": 1.0}
 _ELEM_DTYPES = {"e4m3": torch.float8_e4m3fn, "e2m1": torch.uint8}
 _QUANT_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.uint8, torch.int8)
 
@@ -131,6 +135,8 @@ class _DenseReader:
                 self.by_part.setdefault(part, []).append((fused, idx))
         # target module -> (part count, {part: {role: tensor}}, {part: the roles its module stores})
         self.pending: dict[str, tuple[int, dict[int, dict[str, torch.Tensor]], dict[int, set[str]]]] = {}
+        # the scheme each pending target was stored under, for finalize()
+        self._stored: dict[str, QuantScheme | None] = {}
 
     def scheme(self, module: str) -> QuantScheme | None:
         return None if self.quant is None else self.quant.scheme_for(module)
@@ -173,12 +179,40 @@ class _DenseReader:
             raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} unquantized")
         target, idx, count = self.target(module)
         _, parts, expected = self.pending.setdefault(target, (count, {}, {}))
+        self._stored[target] = stored
         parts.setdefault(idx, {})[role] = tensor
         expected[idx] = set(roles.values())
         if len(parts) < count or any(set(parts[i]) != expected[i] for i in parts):
             return []
         del self.pending[target]
+        self._stored.pop(target, None)
         return self._emit(target, [parts[i] for i in range(count)], stored)
+
+    def finalize(self) -> Iterator[tuple[str, torch.Tensor]]:
+        """Emit the targets the checkpoint completed except for optional roles, then report the rest.
+
+        A scheme declares every role its kind can carry; a given export stores a subset. Waiting
+        for a role the checkpoint never had turns a loadable checkpoint into a missing-tensor
+        error -- which is what Ornith-1.5-35B-A3B-NVFP4 hit: its shared_expert projections and
+        lm_head store weight / weight_scale / weight_scale_2 and no input_scale.
+        """
+        for target in sorted(self.pending):
+            count, parts, expected = self.pending[target]
+            if len(parts) < count:
+                continue
+            missing = {i: expected[i] - set(parts[i]) for i in parts}
+            if any(m - set(_OPTIONAL_ROLES) for m in missing.values()):
+                continue
+            if not any(missing.values()):
+                continue  # complete but unemitted: a bug here, not an optional role
+            for i, roles in missing.items():
+                ref = next(iter(parts[i].values()))
+                for role in roles:
+                    parts[i][role] = torch.tensor(
+                        _OPTIONAL_ROLES[role], dtype=torch.float32, device=ref.device
+                    )
+            del self.pending[target]
+            yield from self._emit(target, [parts[i] for i in range(count)], self._stored.pop(target, None))
 
     def _emit(self, target: str, parts: list[dict[str, torch.Tensor]], stored: QuantScheme | None):
         if stored is not None:
@@ -283,8 +317,10 @@ def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | N
                     yield name, tensor + 1.0  # (1 + weight) baked into the stored norm weight
                 else:
                     yield name, tensor
-    if reader is not None and reader.pending:
-        raise ValueError(f"checkpoint is missing tensors of {sorted(reader.pending)}")
+    if reader is not None:
+        yield from reader.finalize()
+        if reader.pending:
+            raise ValueError(f"checkpoint is missing tensors of {sorted(reader.pending)}")
 
 
 def iter_weights_parallel(
