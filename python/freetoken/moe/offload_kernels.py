@@ -82,6 +82,40 @@ def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
     )
 
 
+def count_routing(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+    """One launch for what was fifteen: both routing histograms, both row masks.
+
+    The tensor-op version issued 8 kernels per layer for the all-rows pair and ~7 more for the
+    real-rows pair, all inside the captured decode graph -- 600 launches per step at 40 layers.
+    Measured at 0.92-0.97 us per launch, entirely dispatch
+    (freetoken-systest results/20260911-collect-cost-decomposed.txt), so the count IS the cost.
+
+    ``OffloadMoeCache._count_routing_ref`` is the readable mirror and the test oracle; this
+    must agree with it exactly.
+    """
+    ids = expert_ids.reshape(-1)
+    n_ids = ids.numel()
+    top_k = max(n_ids // max(expert_ids.shape[0], 1), 1)
+    _count_routing_kernel[(1,)](
+        ids,
+        cache.slot_for_id,
+        cache.decode_freq,
+        cache.decode_miss_freq,
+        cache.decode_freq_real,
+        cache.decode_miss_freq_real,
+        cache._real_rows,
+        layer_id,
+        n_ids,
+        top_k,
+        num_experts=cache.num_experts,
+        BLOCK_N=triton.next_power_of_2(n_ids),
+        # Swept on this box at 40 layers x 256 experts, 1/2/4/8 warps: 2.82 / 2.86 / 2.74 /
+        # 2.53 us per call. One program, so the warp count is what splits the work across the
+        # single SM it lands on.
+        num_warps=8,
+    )
+
+
 def materialize_layer(cache, layer_id: int) -> None:
     _materialize_layer_gpu(cache, layer_id)
 
@@ -434,3 +468,63 @@ def _prefill_hit_compact_kernel(
     tl.store(dst_ptr + pos, (buffer_base + offs).to(tl.int32), mask=is_hit)
     tl.store(src_ptr + pos, slots, mask=is_hit)
     tl.store(num_ptr, tl.sum(is_hit.to(tl.int64)))
+
+
+@triton.jit
+def _count_routing_kernel(
+    ids_ptr,          # [n_ids] raw expert ids, row-major over (row, top_k)
+    slot_ptr,         # [num_layers, num_experts] int32: residency at the step's start
+    freq_ptr,         # [num_layers, num_experts] int64: picks, every row
+    miss_ptr,         # [num_layers, num_experts] int64: distinct missing requests, every row
+    freq_real_ptr,    # [num_layers, num_experts + 1] int64: picks, real rows; last col = pad
+    miss_real_ptr,    # [num_layers, num_experts + 1] int64: the same for misses
+    real_rows_ptr,    # [] int32: how many leading rows are real requests
+    layer_id,
+    n_ids,
+    top_k,
+    num_experts: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Accumulate this step's picks and misses for one layer. Call BEFORE the ensure kernel.
+
+    Preconditions are the caller's, as for _count_routing: ``ids`` must still hold raw expert
+    ids (ensure rewrites them to slots in place) and ``slot_ptr`` the step's incoming residency.
+
+    ``freq`` counts picks; ``miss`` counts DISTINCT requested experts that hold no slot, not
+    picks -- several picks of one expert in a step collapse to one fetch. The _real pair is the
+    same two with pad_batch's dummy rows excluded; their picks are summed into the sentinel
+    column so (all - real) stays checkable against it.
+
+    One program, so the read-modify-write needs no atomics. Fixed shapes throughout: CUDA-graph
+    safe on the same terms as the tensor-op version it replaces.
+    """
+    n_off = tl.arange(0, BLOCK_N)
+    n_lane = n_off < n_ids
+    ids = tl.load(ids_ptr + n_off, mask=n_lane, other=0).to(tl.int32)
+    real_rows = tl.load(real_rows_ptr).to(tl.int32)
+    is_real = n_lane & ((n_off // top_k) < real_rows)
+
+    base = layer_id * num_experts
+    base_r = layer_id * (num_experts + 1)
+    idx = ids.to(tl.int64)
+
+    # Picks: one atomic per pick, not a [num_experts, n_ids] match matrix. Single program, so
+    # lanes colliding on one expert serialise in hardware and the total is still exact.
+    tl.atomic_add(freq_ptr + base + idx, 1, mask=n_lane)
+    tl.atomic_add(freq_real_ptr + base_r + idx, 1, mask=is_real)
+
+    # Misses count DISTINCT requested experts, not picks, so each expert must be charged once.
+    # "First occurrence wins" picks that one representative without a second pass: [n_ids,
+    # n_ids] is 64x smaller than the match matrix at 256 experts.
+    same = (ids[:, None] == ids[None, :]) & n_lane[None, :]
+    earlier = same & (n_off[None, :] < n_off[:, None])
+    missing = tl.load(slot_ptr + base + idx, mask=n_lane, other=0) < 0
+    is_first = tl.sum(earlier.to(tl.int32), axis=1) == 0
+    tl.atomic_add(miss_ptr + base + idx, 1, mask=n_lane & is_first & missing)
+    # The same, but first-among-REAL-rows: a pad row must not be the representative.
+    is_first_real = tl.sum((earlier & is_real[None, :]).to(tl.int32), axis=1) == 0
+    tl.atomic_add(miss_real_ptr + base_r + idx, 1, mask=is_real & is_first_real & missing)
+
+    # Sentinel: the padded rows' own picks, so the two counters' difference is accounted for.
+    tl.atomic_add(freq_real_ptr + base_r + num_experts,
+                  tl.sum((n_lane & ~is_real).to(tl.int64)))

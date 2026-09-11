@@ -881,6 +881,22 @@ class OffloadMoeCache:
     def _count_routing(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Accumulate this step's picks and misses for ``layer_id``. Call BEFORE the kernel.
 
+        One Triton launch on CUDA; ``_count_routing_ref`` is the same arithmetic in tensor ops
+        and is what runs on CPU. The tensor-op form was 15 launches per layer per step inside
+        the captured decode graph, all of it dispatch-bound at ~0.95 us each, so the launch
+        count was the cost (freetoken-systest results/20260911-collect-cost-decomposed.txt).
+        The two must agree exactly; test_the_kernel_matches_the_reference_counter checks it.
+        """
+        if self.device.type == "cuda":
+            from freetoken.moe.offload_kernels import count_routing
+
+            count_routing(self, layer_id, expert_ids)
+        else:
+            self._count_routing_ref(layer_id, expert_ids)
+
+    def _count_routing_ref(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        """The readable mirror of ``_count_routing_kernel``, and its oracle.
+
         Both preconditions are the caller's and neither is checked, because checking costs a
         sync on the captured path: ``expert_ids`` must still hold raw expert ids (the kernel
         rewrites them to slots in place), and ``slot_for_id`` must still hold the step's
@@ -912,10 +928,9 @@ class OffloadMoeCache:
         self.decode_miss_freq[layer_id] += scratch * missing
 
         # The same two, with pad_batch's dummy rows sent to the sentinel column instead. Rows
-        # are the batch dimension, so the mask is per row and broadcasts over top_k.
-        # Rows are the batch dimension: decode passes [padded_batch, top_k]. Built from
-        # shape[0] and numel rather than expand_as so a 1-D expert_ids (one entry per row)
-        # is masked the same way instead of raising.
+        # are the batch dimension -- decode passes [padded_batch, top_k] -- so the mask is per
+        # row and broadcasts over top_k. Built from shape[0] and numel rather than expand_as so
+        # a 1-D expert_ids (one entry per row) is masked the same way instead of raising.
         nrow = expert_ids.shape[0]
         rows = self._row_index[:nrow].unsqueeze(1)
         real = (rows < self._real_rows).expand(nrow, ids.numel() // nrow).reshape(-1)

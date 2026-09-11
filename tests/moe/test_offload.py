@@ -1180,3 +1180,46 @@ def test_real_rows_defaults_to_masking_nothing():
     cache._count_routing(0, ids)  # _real_rows untouched
     assert cache.decode_freq[0].tolist() == cache.decode_freq_real[0][:8].tolist()
     assert int(cache.decode_freq_real[0][8]) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the counting kernel is CUDA-only")
+def test_the_kernel_matches_the_reference_counter():
+    """One Triton launch must produce exactly what fifteen tensor ops produced.
+
+    The kernel exists because the tensor-op form was dispatch-bound -- 0.92-0.97 us per launch,
+    15 launches per layer per step inside the captured decode graph. Speed is not worth a
+    different histogram, so this compares all four counters plus the pad sentinel against
+    _count_routing_ref on the same inputs, across batch shapes and residency patterns, with
+    the pad boundary swept over every row count including both ends.
+    """
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    dev = torch.device("cuda")
+    E, TOP_K = 64, 8
+    torch.manual_seed(20260911)
+    for nrow in (1, 2, 3, 4, 8):
+        for real_rows in range(0, nrow + 1):
+            ids = torch.randint(0, E, (nrow, TOP_K), dtype=torch.int32, device=dev)
+            slots = torch.where(
+                torch.rand((2, E), device=dev) < 0.4,
+                torch.full((2, E), -1, dtype=torch.int32, device=dev),
+                torch.randint(0, 128, (2, E), dtype=torch.int32, device=dev),
+            )
+
+            def build():
+                c = OffloadMoeCache(num_layers=2, num_experts=E, cache_size=128, device=dev)
+                c.slot_for_id.copy_(slots)
+                c._real_rows.fill_(real_rows)
+                return c
+
+            k, r = build(), build()
+            k._count_routing(1, ids)          # cuda -> the kernel
+            r._count_routing_ref(1, ids)      # the tensor ops, explicitly
+            where = f"nrow={nrow} real_rows={real_rows}"
+            assert torch.equal(k.decode_freq, r.decode_freq), f"decode_freq: {where}"
+            assert torch.equal(k.decode_miss_freq, r.decode_miss_freq), f"miss: {where}"
+            assert torch.equal(k.decode_freq_real, r.decode_freq_real), f"freq_real: {where}"
+            assert torch.equal(k.decode_miss_freq_real, r.decode_miss_freq_real), f"miss_real: {where}"
+            # And the identity the sentinel exists for, at every boundary.
+            pad = int(k.decode_freq_real[1][E])
+            assert pad == (nrow - real_rows) * TOP_K, f"sentinel: {where}"
