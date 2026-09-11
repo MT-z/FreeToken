@@ -32,6 +32,14 @@ class ServerArgs(SchedulerConfig):
     # Build and load the checkpoint's vision tower (--vision). Off by default: it is ~0.8 GiB
     # of resident bf16 that text-only serving never reads.
     vision: bool = False
+    # How long a stop waits for in-flight generations before cancelling them. uvicorn's own
+    # default is None -- unbounded -- and server.py:309 then spins until the connections drain,
+    # so a stop cannot complete while a request is still generating. Measured on this box:
+    # 0.5 s with no client and 0.5 s with an idle keep-alive socket, but 22 s with a request
+    # generating 4,096 tokens and 48 s at the 32,768 Claude Code asks for. daemon/server.py
+    # already bounds its own at 3 s for the same reason. The trade is explicit: past this, the
+    # client's stream is cut. 0 keeps uvicorn's unbounded wait.
+    shutdown_grace_seconds: int = 30
     # Default max output (decode) tokens for a request that omits one. None falls back to the
     # adapter's built-in default (32k).
     max_output_tokens: int | None = None
@@ -334,6 +342,15 @@ def parse_args(
         dest="max_extend_tokens",
         default=ServerArgs.max_extend_tokens,
         help="Chunk Prefill maximum chunk size in tokens.",
+    )
+
+    parser.add_argument(
+        "--shutdown-grace-seconds",
+        type=int,
+        default=ServerArgs.shutdown_grace_seconds,
+        help="On stop, wait this long for in-flight generations before cancelling them. "
+             "0 waits forever, which is uvicorn's default and means a stop cannot complete "
+             "while a request is still generating.",
     )
 
     parser.add_argument(

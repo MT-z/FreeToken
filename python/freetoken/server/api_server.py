@@ -59,6 +59,21 @@ _SHUTTING_DOWN = threading.Event()
 BACKEND_DEATH_EXIT_GRACE_S = 10.0
 
 
+def _shutdown_grace() -> int | None:
+    """uvicorn's timeout_graceful_shutdown for this serve, or None for its unbounded default.
+
+    Read through the global state rather than passed down: the shell path builds its uvicorn
+    Server in a helper that never sees the config, and both paths must agree -- a stop that
+    completes on one and hangs on the other is the failure this exists to remove.
+    """
+    from freetoken.server.args import ServerArgs
+
+    state = _GLOBAL_STATE
+    grace = getattr(getattr(state, "config", None), "shutdown_grace_seconds",
+                    ServerArgs.shutdown_grace_seconds)
+    return grace if grace and grace > 0 else None
+
+
 def get_global_state() -> FrontendManager:
     global _GLOBAL_STATE
     assert _GLOBAL_STATE is not None, "Global state is not initialized"
@@ -906,7 +921,10 @@ def _serve_and_run_shell(host: str, port: int) -> None:
     netloc = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
     origin = resolve_server_url(f"http://{netloc}").origin
 
-    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, access_log=False))
+    server = uvicorn.Server(uvicorn.Config(
+        app, host=host, port=port, access_log=False,
+        timeout_graceful_shutdown=_shutdown_grace(),
+    ))
     thread = threading.Thread(target=server.run, name="freetoken-uvicorn", daemon=True)
     thread.start()
     _install_shell_stop_handlers()
@@ -1058,4 +1076,5 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _serve_and_run_shell(host, port)
         return
     # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host=host, port=port,
+                timeout_graceful_shutdown=_shutdown_grace())
