@@ -302,11 +302,6 @@ def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | N
                     if stacked:
                         yield name, f.get_tensor(raw_name)
                     continue
-                if name.startswith("visual."):
-                    # The tower is bf16 throughout with no scales, and its leaf names are not the
-                    # text tower's, so it must not go through the QuantConfig reader.
-                    yield name, f.get_tensor(raw_name)
-                    continue
                 if reader is None:
                     continue
                 tensor = f.get_tensor(raw_name)
