@@ -573,3 +573,37 @@ def test_a_checkpoint_disagreeing_with_its_quant_config_is_rejected(tmp_path, qu
     (tmp_path / "config.json").write_text(json.dumps(_config_json(True, quantization_config)))
     with pytest.raises(ValueError, match=match):
         _load(str(tmp_path))
+
+
+def test_an_nvfp4_export_without_input_scale_still_loads(tmp_path):
+    """A W4A16 export stores no activation scale, and the scheme declaring one must not stop it.
+
+    Ornith-1.5-35B-A3B-NVFP4 is such a checkpoint: its shared_expert projections and lm_head
+    carry weight / weight_scale / weight_scale_2 and nothing else, so waiting for the
+    input_scale the nvfp4 scheme declares left 81 tensors pending and the serve never came up.
+    No W4A16 kernel reads it (quantization/linear/nvfp4.py), so the identity is the answer.
+    The FP8 modules of the same checkpoint keep their input_scale, which W8A8 does read.
+    """
+    moe, qcfg, raw = _layout("modelopt_mixed")
+    w4a16 = tuple(m + ".input_scale" for m in SHARED + ["lm_head"])
+    dropped = [k for k in raw if k.endswith(w4a16)]
+    assert dropped, "the fixture stopped emitting input_scale; this test no longer tests anything"
+    for k in dropped:
+        del raw[k]
+
+    loaded = _load(_write(tmp_path, moe, qcfg, raw))
+
+    assert loaded["lm_head.input_scale"].item() == 1.0
+    assert loaded["lm_head.input_scale"].shape == ()
+    assert loaded["model.layers.0.mlp.shared_expert.gate_up_proj.input_scale"].item() == 1.0
+    assert loaded["model.layers.0.mlp.shared_expert.down_proj.input_scale"].item() == 1.0
+    # The FP8 attention kept the scale the checkpoint stored, rather than being defaulted too.
+    assert loaded["model.layers.1.self_attn.qkv_proj.input_scale"].item() != 1.0
+
+
+def test_a_missing_weight_is_still_an_error(tmp_path):
+    """The default covers optional roles only. A missing weight must stay a missing weight."""
+    moe, qcfg, raw = _layout("modelopt_mixed")
+    del raw[f"{LM}.layers.0.mlp.shared_expert.gate_proj.weight"]
+    with pytest.raises(ValueError, match=r"missing tensors of .*shared_expert\.gate_up_proj"):
+        _load(_write(tmp_path, moe, qcfg, raw))
