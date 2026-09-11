@@ -241,14 +241,70 @@ class OffloadMoeCache:
         self.stat_active_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
         self.stat_fetched_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
         self.stat_steps_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
-        # Opt-in decode routing histogram (per layer, per expert) for cache-skew
-        # analysis. Accumulated in ``ensure_experts`` from the raw expert ids before the
-        # kernel rewrites them to slots. Only accurate with CUDA graphs disabled (the
-        # captured graph would not re-run this host-side scatter on replay).
+        # Opt-in routing histogram (per layer, per expert), accumulated in ``ensure_experts``
+        # from the raw expert ids. Despite the name it also gates the prefill counters.
+        #
+        # Upstream's "only accurate with CUDA graphs disabled" is false: the scatter is a
+        # device op, so capture records it and replay re-executes it (measured, graphs-on
+        # matched graphs-off but for the 7 capture forwards). What IS still open is padding:
+        # pad_batch appends dummy_req rows to reach a captured size, and their picks are
+        # counted -- see results/20260910-graph-vs-nograph-histogram.txt.
         self.collect_decode_freq = False
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
+        # Non-resident picks, not picks: several picks in one step collapse to one fetch and
+        # a resident pick moves nothing. See _count_routing for what it is and is not.
+        self.decode_miss_freq = torch.zeros(
+            (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
+        )
+        self._miss_scratch = torch.zeros(
+            (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
+        )
+        # The same two counters restricted to REAL rows. pad_batch appends dummy_req rows to
+        # reach a captured graph size and their picks land in decode_freq like any other -- a
+        # batch of 3 into the bs=4 graph makes exactly 25% of counted picks synthetic
+        # (measured: token inflation 1.3333 at concurrency 3). Both are kept, not one, because
+        # their difference is checkable: it must equal dummy_rows * top_k exactly, which no
+        # cross-run comparison can establish (graphs off changes the kernels and the greedy
+        # output with them -- 3,412 of 10,240 cells moved the wrong way when that was tried).
+        # One extra column is the sentinel every masked-out pick is sent to, so the mask needs
+        # no bounds-checked scatter.
+        self.decode_freq_real = torch.zeros(
+            (self.num_layers, self.num_experts + 1), dtype=torch.int64, device=self.device
+        )
+        self.decode_miss_freq_real = torch.zeros(
+            (self.num_layers, self.num_experts + 1), dtype=torch.int64, device=self.device
+        )
+        self._miss_scratch_real = torch.zeros(
+            (self.num_layers, self.num_experts + 1), dtype=torch.int64, device=self.device
+        )
+        # How many rows of the decode batch are real. Written host-side before replay (see
+        # GraphRunner.pad_batch) and read device-side inside the captured graph, so the mask
+        # rides the graph without baking a batch size into it. The default masks nothing, so a
+        # caller that never sets it gets the old behaviour rather than empty counters.
+        self._real_rows = torch.full((), 1 << 30, dtype=torch.int32, device=self.device)
+        # Real decode tokens this run, summed host-side from the same place that knows the
+        # real row count. The placement objective needs a token denominator, and deriving it
+        # as decode_freq.sum() // (num_layers * top_k) both hardcodes top_k in the consumer
+        # and counts pad_batch's rows as tokens. Counted, not derived.
+        self.decode_tokens = 0
+        self._row_index = torch.arange(1024, dtype=torch.int32, device=self.device)
+        self._sentinel_id = torch.tensor(
+            self.num_experts, dtype=torch.int64, device=self.device
+        )
+        # Prefill counterpart: experts not resident at chunk start, which is what crosses the
+        # bus since a chunk touches every expert. Hit is slot >= 2*num_experts, not >= 0 --
+        # the double buffer owns the slots below and its bytes are volatile within the chunk.
+        # Only meaningful under --moe-prefill-hit-d2d: with it off this stays zero, which does
+        # NOT mean everything was resident (routing_histogram records which it was).
+        # device="cpu" explicitly: its accumulation partner is the pinned host snapshot, so
+        # host is where it belongs -- and leaving that to torch's default made it the one
+        # tensor here whose device depended on process state.
+        self.prefill_miss_freq = torch.zeros(
+            (self.num_layers, self.num_experts), dtype=torch.int64, device="cpu"
+        )
+        self.prefill_chunks = 0
         # (per-layer sources, cache) per bank, in schema order. Every piece of cache
         # machinery that moves bank bytes (copy_missing, the prefill double buffers,
         # bank_views) iterates this list, so the slot cache is bank-count agnostic.
@@ -519,7 +575,7 @@ class OffloadMoeCache:
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
-        self.decode_freq.zero_()
+        self.reset_routing_freq()
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
@@ -664,6 +720,11 @@ class OffloadMoeCache:
             with torch.cuda.stream(self.prefill_copy_stream):
                 self._prefill_slot_snapshot.copy_(self.slot_for_id, non_blocking=True)
             self.prefill_copy_stream.synchronize()
+            if self.collect_decode_freq:
+                self.prefill_miss_freq += (
+                    self._prefill_slot_snapshot < 2 * self.num_experts
+                ).to(self.prefill_miss_freq.dtype)
+                self.prefill_chunks += 1
 
     def prefetch_prefill_layer(self, layer_id: int) -> None:
         if not self.prefill_overlap or layer_id >= self.num_layers:
@@ -840,14 +901,76 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
+    def _count_routing(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        """Accumulate this step's picks and misses for ``layer_id``. Call BEFORE the kernel.
+
+        One Triton launch on CUDA; ``_count_routing_ref`` is the same arithmetic in tensor ops
+        and is what runs on CPU. The tensor-op form was 15 launches per layer per step inside
+        the captured decode graph, all of it dispatch-bound at ~0.95 us each, so the launch
+        count was the cost (freetoken-systest results/20260911-collect-cost-decomposed.txt).
+        The two must agree exactly; test_the_kernel_matches_the_reference_counter checks it.
+        """
+        if self.device.type == "cuda":
+            from freetoken.moe.offload_kernels import count_routing
+
+            count_routing(self, layer_id, expert_ids)
+        else:
+            self._count_routing_ref(layer_id, expert_ids)
+
+    def _count_routing_ref(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        """The readable mirror of ``_count_routing_kernel``, and its oracle.
+
+        Both preconditions are the caller's and neither is checked, because checking costs a
+        sync on the captured path: ``expert_ids`` must still hold raw expert ids (the kernel
+        rewrites them to slots in place), and ``slot_for_id`` must still hold the step's
+        incoming residency (``lru_ensure`` updates it). ``-1`` is the decode miss condition;
+        see ``_ensure_experts_hybrid_cpu``, the readable mirror of what flashlib's
+        ``lru_ensure`` does.
+
+        ``decode_freq`` counts picks. ``decode_miss_freq`` counts non-resident picks, which on
+        the ``offload`` path is the fetch count and therefore proportional to bytes -- and on
+        the ``hybrid`` path is NOT: ``ensure_experts_hybrid`` fetches at most
+        ``hybrid_max_fetch`` of them and leaves the overflow at -1 for the CPU, so a capped
+        expert is counted every step while moving nothing. ``stat_fetched`` is the post-cap
+        count. ``routing_histogram`` records ``decode_target`` so a dump can be read for which
+        of the two it is.
+
+        Verified against the engine's own ``lru_stats``, which the kernel accumulates in its
+        own launch and shares no code with this: delta ``decode_miss_freq.sum()`` equalled
+        ``window_missing`` in all 211 windows of five runs at four coverages.
+
+        Fixed shape throughout, so it is CUDA-graph safe on the same terms as decode_freq.
+        """
+        ids = expert_ids.reshape(-1).long()
+        ones = torch.ones_like(ids)
+        self.decode_freq[layer_id].scatter_add_(0, ids, ones)
+        scratch = self._miss_scratch[layer_id]
+        scratch.zero_()
+        scratch.scatter_(0, ids, 1)  # 1 per distinct requested expert, not per pick
+        missing = self.slot_for_id[layer_id] < 0
+        self.decode_miss_freq[layer_id] += scratch * missing
+
+        # The same two, with pad_batch's dummy rows sent to the sentinel column instead. Rows
+        # are the batch dimension -- decode passes [padded_batch, top_k] -- so the mask is per
+        # row and broadcasts over top_k. Built from shape[0] and numel rather than expand_as so
+        # a 1-D expert_ids (one entry per row) is masked the same way instead of raising.
+        nrow = expert_ids.shape[0]
+        rows = self._row_index[:nrow].unsqueeze(1)
+        real = (rows < self._real_rows).expand(nrow, ids.numel() // nrow).reshape(-1)
+        ids_real = torch.where(real, ids, self._sentinel_id)
+        self.decode_freq_real[layer_id].scatter_add_(0, ids_real, ones)
+        scratch_r = self._miss_scratch_real[layer_id]
+        scratch_r.zero_()
+        scratch_r.scatter_(0, ids_real, 1)
+        self.decode_miss_freq_real[layer_id][: self.num_experts] += (
+            scratch_r[: self.num_experts] * missing
+        )
+
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
 
         if self.collect_decode_freq:
-            # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
-            # slot ids in place), so snapshot the routing histogram before that happens.
-            ids = expert_ids.reshape(-1).long()
-            self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+            self._count_routing(layer_id, expert_ids)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
@@ -865,8 +988,7 @@ class OffloadMoeCache:
         from freetoken.moe.offload_kernels import ensure_experts_hybrid
 
         if self.collect_decode_freq:
-            ids = expert_ids.reshape(-1).long()
-            self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+            self._count_routing(layer_id, expert_ids)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts_hybrid(
@@ -884,9 +1006,90 @@ class OffloadMoeCache:
         from freetoken.moe.offload_kernels import reset_cache
 
         reset_cache(self)
+        # Callers (warmup, graph capture) reset residency so their synthetic traffic does not
+        # count; BOTH counter generations have to follow, or the first snapshot after a reset
+        # reports a histogram holding only real traffic beside window totals that still hold
+        # warmup -- and the miss identity (delta decode_miss_freq.sum() == window_missing)
+        # fails on exactly that window. reset_stats alone is the every-report case; reset is
+        # the "this traffic never happened" case and needs both.
+        self.reset_routing_freq()
+        self.reset_stats()
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
+
+    def routing_histogram(self) -> dict:
+        """The run-cumulative histogram plus everything needed to read it correctly.
+
+        The engine used to assemble this by naming nine private fields, which is how three
+        errors got in: window-scoped counters beside run-cumulative ones with nothing saying
+        which was which, exact integers reconstructed from float ratios, and a live CPU
+        tensor where the two beside it were copies.
+
+        Fields ending in _window are cleared by reset_stats every report; the histograms and
+        prefill_chunks accumulate for the run (reset_routing_freq). decode_target and
+        prefill_hit_d2d_active decide what the numbers MEAN and neither is recoverable from
+        the file without them -- see decode_miss_freq's definition for the hybrid caveat, and
+        prefill_miss_freq's for what a zero means with hit-d2d off.
+        """
+        active, missing, calls = self.window_totals()
+        return {
+            "decode_freq": self.decode_freq.cpu(),
+            "decode_miss_freq": self.decode_miss_freq.cpu(),
+            # The same two counting only real rows; the sentinel column (index num_experts)
+            # holds what pad_batch's dummy rows contributed, so the contamination is readable
+            # from one dump instead of inferred from two runs.
+            "decode_freq_real": self.decode_freq_real[:, : self.num_experts].cpu(),
+            "decode_miss_freq_real": self.decode_miss_freq_real[:, : self.num_experts].cpu(),
+            "decode_freq_padrows": self.decode_freq_real[:, self.num_experts].cpu(),
+            # Real decode tokens, counted rather than reconstructed from a top_k the reader
+            # would have to know. Run-cumulative, like the histograms.
+            "decode_tokens": self.decode_tokens,
+            # .clone(), not .cpu(): this one is already on the host, where .cpu() returns the
+            # live accumulator rather than a copy.
+            "prefill_miss_freq": self.prefill_miss_freq.clone(),
+            "prefill_chunks": self.prefill_chunks,
+            "prefill_hit_rows_window": self.prefill_hit_rows,
+            "prefill_total_rows_window": self.prefill_total_rows,
+            # Straight off window_totals, the same getter the log line uses, so the two
+            # cannot end up reading different counters (hybrid writes stat_*, not lru_stats).
+            # The engine's report divides these by calls; multiplying the ratio back and
+            # truncating loses a whole unit for most layer counts (exact at 40x256 only
+            # because 10240 = 5*2^11).
+            "window_active": active,
+            "window_missing": missing,
+            "window_layer_calls": calls,
+            "cache_size": self.cache_size,
+            "num_layers": self.num_layers,
+            "num_experts": self.num_experts,
+            # Which layers the decode counters actually cover: a CPU-executed layer returns
+            # before ensure_experts (layers/moe.py MoELayer._decode_routed), so its rows stay
+            # zero while prefill_miss_freq -- classified from the full snapshot -- does not.
+            "decode_counted_layers": sorted(
+                set(range(self.num_layers)) - set(self.cpu_layer_ids or ())
+            ),
+            "decode_target": self.decode_target,
+            "prefill_hit_d2d_active": bool(self._prefill_hit_d2d_active),
+        }
+
+    def reset_routing_freq(self) -> None:
+        """Zero the run-cumulative routing counters. Deliberately NOT part of reset_stats.
+
+        Two reset generations exist and mixing them is what the counters get wrong. reset_stats
+        runs every report and clears the per-window counters; these four accumulate across
+        reports because the histogram is a whole-run object. They must still be cleared
+        wherever residency semantics change under them -- rebuild (cache_size changed, so old
+        miss counts cannot be mixed with new picks: that yields miss > pick) and reset (the
+        synthetic traffic of warmup and graph capture, which the callers clear residency for
+        precisely so it does not count).
+        """
+        self.decode_freq.zero_()
+        self.decode_miss_freq.zero_()
+        self.decode_freq_real.zero_()
+        self.decode_miss_freq_real.zero_()
+        self.decode_tokens = 0
+        self.prefill_miss_freq.zero_()
+        self.prefill_chunks = 0
 
     def reset_stats(self) -> None:
         self.prefill_hit_rows = 0
@@ -925,13 +1128,24 @@ class OffloadMoeCache:
         self.stat_active_layer[layer_id] += active
         self.stat_steps_layer[layer_id] += 1
 
-    def decode_miss_stats(self) -> dict:
+    def window_totals(self) -> tuple[int, int, int]:
+        """``(active, missing, layer_calls)`` for the current window, from whichever counters
+        this decode target actually writes.
+
+        ``ensure_experts`` accumulates into ``lru_stats`` inside its own launch, but
+        ``ensure_experts_hybrid`` runs a different kernel and never touches it -- the hybrid
+        path's totals live in ``stat_active``/``stat_missing``/``stat_calls``, written by
+        ``record_decode_stats_hybrid``. Reading ``lru_stats`` unconditionally is therefore
+        three zeros on hybrid, next to a log line that shows misses. This exists so the log
+        and the dump cannot disagree about which counters the window is in: both call it.
+        """
         if self.decode_target == "hybrid":
-            active = int(self.stat_active.item())
-            missing = int(self.stat_missing.item())
-            calls = int(self.stat_calls.item())
-        else:
-            active, missing, calls = (int(x) for x in self.lru_stats.sum(0))
+            return (int(self.stat_active.item()), int(self.stat_missing.item()),
+                    int(self.stat_calls.item()))
+        return tuple(int(x) for x in self.lru_stats.sum(0))
+
+    def decode_miss_stats(self) -> dict:
+        active, missing, calls = self.window_totals()
         fetched = int(self.stat_fetched.item())
         return {
             "layer_calls": calls,

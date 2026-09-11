@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import gc
 import math
+import contextlib
+import errno
 import os
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
@@ -373,6 +375,7 @@ class ForwardOutput(NamedTuple):
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
+        self.tp_info = config.tp_info
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         set_quant_backend(_adjust_ftw_quant_backend(config.model_path, QuantBackend.parse(config.quant_backend)))
         _ensure_expandable_segments()  # before the first CUDA allocation below
@@ -415,6 +418,9 @@ class Engine:
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
         self._moe_stats_step = 0
+        # Set once FREETOKEN_MOE_FREQ_OUT has failed to write, so the warning is one line and
+        # not one per report. Never reset: the path does not become writable mid-run.
+        self._moe_freq_out_failed = False
         self.cpu_moe_executor = None
         # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
@@ -1071,6 +1077,12 @@ class Engine:
                 "MoE cache worst layers: "
                 + ", ".join(f"L{L['layer']}={L['miss_rate']:.3f}" for L in worst)
             )
+        # The logged oracle_hit is one point on a curve: the bound at *this* cache size.
+        # What decides whether a smaller cache could still work is the whole curve, and the
+        # histogram it comes from is device-side and never leaves. FREETOKEN_MOE_FREQ_OUT
+        # writes it out (overwriting, so the last window holds the whole run) so the curve
+        # can be swept offline instead of by rebooting the serve once per cache size.
+        self._dump_routing_histogram(cache)
         routing = cache.decode_routing_stats()
         if routing:
             # oracle_hit_at_slots is the upper bound on hit rate for *any* policy with this
@@ -1089,6 +1101,50 @@ class Engine:
                 f"norm_entropy={routing['norm_entropy']:.3f}"
             )
         cache.reset_stats()
+
+    def _dump_routing_histogram(self, cache) -> None:
+        """FREETOKEN_MOE_FREQ_OUT: the whole-run histogram, so the cache-size curve can be
+        swept offline instead of by rebooting the serve once per size.
+
+        Rank 0 only, and via a pid-suffixed temp file, because both the destination and the
+        temp name are shared by every rank otherwise.
+        """
+        freq_out = os.environ.get("FREETOKEN_MOE_FREQ_OUT")
+        if not freq_out or self._moe_freq_out_failed or not self.tp_info.is_primary():
+            return
+        payload = cache.routing_histogram()
+        tmp = f"{freq_out}.tmp.{os.getpid()}"
+        try:
+            torch.save(payload, tmp)
+            os.replace(tmp, freq_out)
+        except (OSError, RuntimeError) as e:
+            # Runs in the decode loop, so it must not take the serve with it. Latch only on
+            # errors a retry cannot fix; ENOSPC and EIO are how a healthy path fails once,
+            # and latching on those would end collection for a multi-hour run over a
+            # transient. The device reads are outside the try, so a CUDA error stays itself.
+            #
+            # Permanence is a property of the DESTINATION, not of the exception type. The
+            # earlier version read `or isinstance(e, RuntimeError)`, which contradicted the
+            # paragraph above: torch.save reports a missing parent directory and a failed
+            # write with the same RuntimeError, so one full disk ended collection for the
+            # rest of the run. Ask the directory instead -- a typo in the env var still fails
+            # every time, a full or flaky one is retried at the next report.
+            dest_dir = os.path.dirname(freq_out) or "."
+            permanent = (
+                getattr(e, "errno", None) in (
+                    errno.ENOENT, errno.EACCES, errno.EISDIR, errno.ENOTDIR, errno.EROFS
+                )
+                or not os.path.isdir(dest_dir)
+                or not os.access(dest_dir, os.W_OK | os.X_OK)
+                or os.path.isdir(freq_out)
+            )
+            logger.warning_rank0(
+                f"FREETOKEN_MOE_FREQ_OUT={freq_out!r} cannot be written ({e})"
+                + ("; giving up for this run" if permanent else "; will retry next report")
+            )
+            self._moe_freq_out_failed = permanent
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
