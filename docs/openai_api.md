@@ -23,6 +23,12 @@ effect; "400" means the server refuses the request with a clear message.
 | `POST /v1/audio/*`, `/v1/files`, `/v1/batches` | no | transcriptions, batch runner (offline) | transcriptions, files, batches | no |
 | `POST /infill`, `/apply-template`, `/completion` (non-OpenAI) | `suffix` on `/v1/completions`; `/tokenize` with `messages` renders the template | no | no | yes |
 
+> **Reasoning models need a large `max_output_tokens` on `/v1/responses`.** A small budget is
+> spent entirely inside the `reasoning` item, and the response comes back with **no `message`
+> item and `status: completed`** -- it does not read as an error. Measured on llama.cpp with
+> Ornith-1.5-35B-A3B: `max_output_tokens: 16` returned reasoning only, `2048` returned the
+> answer. FreeToken's behaviour on this path is **not measured**.
+
 ## Chat completions: request
 
 | parameter | FreeToken | vLLM | SGLang | llama.cpp |
