@@ -310,3 +310,24 @@ def test_validate_rebuild_targets_flow_by_kv_cost_signature():
         baseline_free=10 * per_page, weights_bytes=0, current_num_pages=10,
         num_swa_pages=None, future_family_key=None,
     )
+
+
+def test_snapshot_cache_holds_a_whole_donate_ring():
+    """A request commits its whole ring at once. A cross-request cache smaller than the ring
+    evicts the prompt's own earlier boundaries before anyone can branch at them -- measured on
+    Ornith-1.5-35B: a ring of 8 donated 6 boundaries into 4 cache slots, and a branch that
+    should have resumed at 32,704 fell back to 16,320."""
+    from types import SimpleNamespace
+
+    from freetoken.kvcache.linear_state_pool import _linear_pool_num_slots
+
+    def cache_slots(track, mr=1, ratio=2.0):
+        cfg = SimpleNamespace(max_running_req=mr, cache_type="hybrid_radix",
+                              linear_state_cache_ratio=ratio, mamba_track_slots=track)
+        return _linear_pool_num_slots(cfg) - ((2 + track) * mr + 1)
+
+    assert cache_slots(8) >= 8
+    assert cache_slots(16) >= 16
+    assert cache_slots(4, mr=3) >= 4 * 3
+    # the shipped 2-face default is unchanged: the ratio floor of 4 already covers it
+    assert cache_slots(2) == 4
