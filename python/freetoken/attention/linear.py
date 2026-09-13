@@ -133,19 +133,44 @@ def _build_track_metadata(reqs, cu_host, device, pin):
             # cf == 0: no boundary at or before the fork inside this extend -- keep the default
             r.mamba_fork_len = None  # consumed (or unreachable); later chunks track as usual
         off = int(cu_host[i])
-        boundary = r.cached_len + c * CHUNK_SIZE
-        dst.append(r.mamba_track_slots[r.mamba_next_track_idx])
-        h_row.append(boh[i] + c)
-        conv_src.append([off + c * CHUNK_SIZE - km1 + j for j in range(km1)])
-        boundary_rows.append(off + c * CHUNK_SIZE)
-        # Record the boundary IN the face we are about to overwrite, then advance the ring. The
-        # face keeps its boundary until the ring wraps onto it again, so the final chunk's commit
-        # can donate every face that still holds a distinct prefill-chunk snapshot.
         seqlens = list(r.mamba_track_seqlens)
-        seqlens[r.mamba_next_track_idx] = boundary
+        # getattr: the track-metadata tests drive this with SimpleNamespace stubs that carry no
+        # split (same reason as mamba_fork_len above). No split -> every face is fine.
+        n_fine = getattr(r, "mamba_fine_faces", 0) or len(r.mamba_track_slots)
+
+        def emit(face: int, cc: int) -> int:
+            dst.append(r.mamba_track_slots[face])
+            h_row.append(boh[i] + cc)
+            conv_src.append([off + cc * CHUNK_SIZE - km1 + j for j in range(km1)])
+            boundary_rows.append(off + cc * CHUNK_SIZE)
+            seqlens[face] = r.cached_len + cc * CHUNK_SIZE
+            return seqlens[face]
+
+        # FINE: the tail, at chunk granularity. Round-robin, so a face keeps its boundary until
+        # the ring wraps onto it -- the fine ring length is how many trailing chunk boundaries
+        # reach the commit.
+        r.mamba_last_track_seqlen = emit(r.mamba_next_track_idx, c)
+        r.mamba_next_track_idx = (r.mamba_next_track_idx + 1) % n_fine
+        # COARSE: fixed, absolute boundaries so the FRONT of a long prompt is reachable too. Each
+        # face is written once, by whichever forward's extend crosses its target; h already holds
+        # every ×64 state of this extend, so the extra snapshots are copies, not recomputation.
+        stride = getattr(r, "mamba_coarse_stride", 0)
+        if stride:
+            end = r.cached_len + r.extend_len
+            # Successive extends partition (cached_len, input_len], so each target falls inside
+            # exactly one of them: a face is written once without needing a guard.
+            for k in range(1, len(r.mamba_track_slots) - n_fine + 1):
+                face = n_fine + k - 1
+                target = k * stride
+                if not (r.cached_len < target <= end):
+                    continue
+                # Deepest trackable ×64 boundary at or below the target. Clamping to c matters
+                # when the target lands between this extend's last boundary and its end: without
+                # it the face is never taken, because the next extend starts past the target.
+                ck = min(c, (target - r.cached_len) // CHUNK_SIZE)
+                if ck >= 1:
+                    emit(face, ck)
         r.mamba_track_seqlens = tuple(seqlens)
-        r.mamba_last_track_seqlen = boundary
-        r.mamba_next_track_idx = (r.mamba_next_track_idx + 1) % len(r.mamba_track_slots)
     if not dst:
         return empty
     to = lambda xs, **kw: torch.tensor(xs, **pin, **kw).to(device, non_blocking=True)

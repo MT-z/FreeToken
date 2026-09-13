@@ -39,6 +39,29 @@ class ChunkedReq(Req):
         return False  # avoid being added to decode manager
 
 
+def _split_track_ring(n_slots: int, input_len: int) -> tuple[int, int]:
+    """Split the donate ring into (fine faces, coarse stride).
+
+    The fine faces round-robin over prefill forwards, so they always describe the TAIL at chunk
+    granularity -- which is where a client that resends its conversation branches. The coarse
+    faces are pinned to absolute multiples of the stride, so the FRONT of a long prompt is
+    reachable at all; without them a 120k prompt put every boundary in its last 54k and a branch
+    before that re-prefilled the whole thing.
+
+    Returns (n_slots, 0) -- all faces fine -- when the ring is too small to spare one, or when
+    the prompt is shorter than one GDN chunk per coarse face.
+    """
+    from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
+    n_coarse = n_slots // 3
+    if n_coarse < 1:
+        return n_slots, 0
+    stride = ((input_len // (n_coarse + 1)) // CHUNK_SIZE) * CHUNK_SIZE
+    if stride < CHUNK_SIZE:
+        return n_slots, 0
+    return n_slots - n_coarse, stride
+
+
 @dataclass
 class PrefillAdder:
     token_budget: int
@@ -126,10 +149,13 @@ class PrefillAdder:
             self.table_manager.page_table[table_idx][cached_len - n : cached_len].copy_(matched)
 
         linear_slot_idx = track_slots = None
+        fine_faces = coarse_stride = 0
         if self.cache_manager.is_hybrid:
             pool = self.cache_manager.linear_state_pool
             linear_slot_idx = pool.alloc(1)[0]
-            track_slots = tuple(pool.alloc(self.cache_manager.track_slots))
+            n = self.cache_manager.track_slots
+            track_slots = tuple(pool.alloc(n))
+            fine_faces, coarse_stride = _split_track_ring(n, req.input_len)
 
         # Fork: the tree matched more tokens than it could hand over (no live snapshot at
         # them). Remember where, so the chunk that re-prefills across it tracks a snapshot
@@ -137,7 +163,8 @@ class PrefillAdder:
         fork_len = None
         if track_slots is not None and mr.tok_match is not None and mr.tok_match > cached_len:
             fork_len = mr.tok_match
-        return handle, table_idx, linear_slot_idx, track_slots, mr.mamba_value, fork_len
+        return (handle, table_idx, linear_slot_idx, track_slots, mr.mamba_value, fork_len,
+                fine_faces, coarse_stride)
 
     def _add_one_req(
         self,
@@ -148,6 +175,8 @@ class PrefillAdder:
         linear_slot_idx: int | None = None,
         track_slots: tuple | None = None,
         track_seqlens: tuple | None = None,
+        fine_faces: int = 0,
+        coarse_stride: int = 0,
         next_track_idx: int = 0,
         restore_src: int | None = None,
         swa_evicted_seqlen: int = 0,
@@ -224,6 +253,8 @@ class PrefillAdder:
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
         req.linear_slot_idx = linear_slot_idx
         req.mamba_track_slots = track_slots
+        req.mamba_fine_faces = fine_faces
+        req.mamba_coarse_stride = coarse_stride
         req.mamba_next_track_idx = next_track_idx
         # Fresh admit: no face has been written yet. Continuation: inherit the ring as it stands,
         # so every boundary an intermediate chunk tracked is still addressable at the final commit.
@@ -249,6 +280,8 @@ class PrefillAdder:
                 linear_slot_idx=chunked_req.linear_slot_idx,
                 track_slots=chunked_req.mamba_track_slots,
                 track_seqlens=chunked_req.mamba_track_seqlens,
+                fine_faces=chunked_req.mamba_fine_faces,
+                coarse_stride=chunked_req.mamba_coarse_stride,
                 next_track_idx=chunked_req.mamba_next_track_idx,
                 restore_src=None,  # continuation chunk already has live state
                 swa_evicted_seqlen=chunked_req.swa_evicted_seqlen,  # extend-free watermark so far
@@ -257,7 +290,8 @@ class PrefillAdder:
             )
 
         if resource := self._try_allocate_one(pending_req):
-            cache_handle, table_idx, linear_slot_idx, track_slots, restore_src, fork_len = resource
+            (cache_handle, table_idx, linear_slot_idx, track_slots, restore_src, fork_len,
+             fine_faces, coarse_stride) = resource
             req = self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=cache_handle,
@@ -265,6 +299,8 @@ class PrefillAdder:
                 cached_len=cache_handle.cached_len,
                 linear_slot_idx=linear_slot_idx,
                 track_slots=track_slots,
+                fine_faces=fine_faces,
+                coarse_stride=coarse_stride,
                 next_track_idx=0,
                 restore_src=restore_src,
                 fork_len=fork_len,

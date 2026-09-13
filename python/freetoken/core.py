@@ -102,6 +102,16 @@ class Req:
     # Boundary recorded in each face, parallel to mamba_track_slots; None = face never written.
     mamba_track_seqlens: tuple[int | None, ...] | None = None
     mamba_last_track_seqlen: int | None = None      # chunk-aligned committed len of the last snapshot
+    # The ring is split. Faces [0, mamba_fine_faces) are the round-robin FINE ring: one boundary
+    # per prefill forward, so they track the tail at chunk granularity. Faces
+    # [mamba_fine_faces, len) are COARSE: face n+k-1 is dedicated to absolute boundary
+    # k*mamba_coarse_stride and written once, when a forward's extend crosses it. Without the
+    # coarse half a long prompt spends its whole budget on the tail -- measured at 120,185
+    # tokens: every boundary landed in the last 54,713, and a branch before 65,472 re-prefilled
+    # all 120k (26.87s). A uniform stride would fix that by making the tail coarser, which is
+    # the wrong trade: a client that resends the conversation branches near the end.
+    mamba_fine_faces: int = 0
+    mamba_coarse_stride: int = 0                    # 0 = no coarse faces
     # Fork length: the tree matched this request's tokens up to here (tok_match) but its deepest
     # live snapshot was shorter, so [cached_len, fork) is re-prefilled. The prefill chunk that
     # spans it tracks its ×64 snapshot AT the fork instead of at the chunk's deepest boundary,

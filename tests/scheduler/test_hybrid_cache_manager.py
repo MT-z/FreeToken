@@ -408,7 +408,7 @@ def test_prefill_admission_records_the_fork_and_carries_it_across_chunks():
     assert cont2.mamba_fork_len is None
 
 
-def _track_boundary(*, cached_len, extend_len, fork, pool):
+def _track_boundary(*, cached_len, extend_len, fork, pool, faces=(1, 2), fine=None, stride=0):
     """Run _build_track_metadata on one hand-built request; return (boundary, remaining fork)."""
     from freetoken import core
     from freetoken.attention.linear import _build_track_metadata
@@ -418,12 +418,16 @@ def _track_boundary(*, cached_len, extend_len, fork, pool):
     set_global_ctx(Context(page_size=1, linear_state_pool=pool))
     try:
         r = SimpleNamespace(cached_len=cached_len, extend_len=extend_len, mamba_fork_len=fork,
-                            mamba_track_slots=(1, 2), mamba_track_seqlens=(None, None), mamba_next_track_idx=0,
-                            mamba_last_track_seqlen=None)
+                            mamba_track_slots=faces,
+                            mamba_track_seqlens=(None,) * len(faces), mamba_next_track_idx=0,
+                            mamba_last_track_seqlen=None,
+                            mamba_fine_faces=fine if fine is not None else len(faces),
+                            mamba_coarse_stride=stride)
         cu = torch.tensor([0, extend_len], dtype=torch.int32)
         md = _build_track_metadata([r], cu, torch.device("cpu"), {})
         if md["track_dst"] is None:
             return None, r.mamba_fork_len
+        _track_boundary.last = (md, r)   # the coarse tests read the full row set off this
         return r.mamba_last_track_seqlen, r.mamba_fork_len
     finally:
         core._GLOBAL_CTX = None
@@ -546,3 +550,98 @@ def test_two_faces_on_one_boundary_cost_one_clone():
     assert m.cuda_handle.get_matched_indices().tolist() == pages[:4]
     cm.cache_req(req, finished=True)
     cm.check_integrity()
+
+
+# ---------------------------------------------------------------------------
+# Split ring. Measured 2026-09-13 at 120,185 tokens with 8 fine faces: every boundary landed in
+# the last 54,713 (65,472 .. 120,128) and a branch at 63,311 re-prefilled all 120k (26.87s).
+# The fine faces round-robin, so on a long prompt they only ever describe the tail.
+# ---------------------------------------------------------------------------
+
+def _track_rows(*, cached_len, extend_len, faces, fine, stride, pool):
+    """Every (dst face, boundary) the forward writes for one request."""
+    from freetoken import core
+    from freetoken.attention.linear import _build_track_metadata
+    from freetoken.core import Context, set_global_ctx
+
+    core._GLOBAL_CTX = None
+    set_global_ctx(Context(page_size=1, linear_state_pool=pool))
+    try:
+        r = SimpleNamespace(cached_len=cached_len, extend_len=extend_len, mamba_fork_len=None,
+                            mamba_track_slots=faces, mamba_track_seqlens=(None,) * len(faces),
+                            mamba_next_track_idx=0, mamba_last_track_seqlen=None,
+                            mamba_fine_faces=fine, mamba_coarse_stride=stride)
+        cu = torch.tensor([0, extend_len], dtype=torch.int32)
+        md = _build_track_metadata([r], cu, torch.device("cpu"), {})
+        if md["track_dst"] is None:
+            return [], r
+        return [(int(d), int(b)) for d, b in
+                zip(md["track_dst"].tolist(), md["track_boundary_row"].tolist())], r
+    finally:
+        core._GLOBAL_CTX = None
+
+
+def test_split_ring_reserves_coarse_faces_for_the_front():
+    from freetoken.kernel.fla.chunk import CHUNK_SIZE
+    from freetoken.scheduler.prefill import _split_track_ring
+
+    fine, stride = _split_track_ring(8, 120_185)
+    assert fine == 6 and 8 - fine == 2          # N // 3 coarse
+    assert stride % CHUNK_SIZE == 0
+    assert stride * (8 - fine) < 120_185        # the targets land inside the prompt
+    # too few faces to spare one, and a prompt too short to need coarse coverage
+    assert _split_track_ring(2, 120_185) == (2, 0)
+    assert _split_track_ring(8, 100) == (8, 0)
+
+
+def test_forward_writes_a_coarse_face_when_its_target_is_inside_the_extend():
+    """A coarse target crossed by this extend gets its own dedicated face, on top of the fine
+    one -- h already holds every ×64 state, so it is a copy, not a second forward."""
+    pool = _pool(num_slots=32)
+    faces = (10, 11, 12, 13)                      # fine = 10,11 ; coarse = 12,13
+    rows, r = _track_rows(cached_len=0, extend_len=8192, faces=faces, fine=2,
+                          stride=4096, pool=pool)
+    dsts = [d for d, _ in rows]
+    assert 10 in dsts, "the fine face is still written"
+    assert 12 in dsts, "the coarse face for target 4096 is written too"
+    assert len(set(dsts)) == len(dsts), "index_copy_ needs distinct destinations"
+    assert dict(rows)[12] == 4096                 # landed on the target
+    assert r.mamba_last_track_seqlen == 8128      # fine still tracks the extend's deepest ×64
+    # face 13's target (8192) sits between this extend's deepest ×64 boundary and its end, so
+    # it takes 8128 rather than going unclaimed forever (the next extend starts past 8192).
+    assert dict(rows)[13] == 8128
+
+
+def test_each_coarse_face_is_claimed_by_exactly_one_chunk():
+    pool = _pool(num_slots=32)
+    faces = (10, 11, 12, 13)
+    # stride 12288: face 12's target 12288 is in the SECOND extend, face 13's (24576) past both
+    r = _track_rows(cached_len=0, extend_len=8192, faces=faces, fine=2, stride=12288, pool=pool)[1]
+    assert r.mamba_track_seqlens[2] is None       # target not reached by the first extend
+    # a second forward over [8192, 16384) must not re-take face 12 for the same target
+    from freetoken import core
+    from freetoken.attention.linear import _build_track_metadata
+    from freetoken.core import Context, set_global_ctx
+
+    core._GLOBAL_CTX = None
+    set_global_ctx(Context(page_size=1, linear_state_pool=pool))
+    try:
+        r.cached_len, r.extend_len = 8192, 8192
+        md = _build_track_metadata([r], torch.tensor([0, 8192], dtype=torch.int32),
+                                   torch.device("cpu"), {})
+    finally:
+        core._GLOBAL_CTX = None
+    assert r.mamba_track_seqlens[2] == 12288      # taken by THIS extend, at its target
+    assert r.mamba_track_seqlens[3] is None       # 24576 is past this extend too
+    # a third forward must not re-take face 12
+    core._GLOBAL_CTX = None
+    set_global_ctx(Context(page_size=1, linear_state_pool=pool))
+    try:
+        r.cached_len, r.extend_len = 16384, 8192
+        md3 = _build_track_metadata([r], torch.tensor([0, 8192], dtype=torch.int32),
+                                    torch.device("cpu"), {})
+    finally:
+        core._GLOBAL_CTX = None
+    assert r.mamba_track_seqlens[2] == 12288      # the second chunk's, not re-taken
+    assert r.mamba_track_seqlens[3] == 24512      # face 13's target 24576 -> clamped to 24512
+    assert 12 not in [int(d) for d in md3["track_dst"].tolist()]
