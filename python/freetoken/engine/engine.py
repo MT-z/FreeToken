@@ -1159,6 +1159,18 @@ class Engine:
         (``self.model.forward()`` directly, never ``graph_runner.replay``), text only.
         """
         assert torch.cuda.current_stream() == self.stream
+        # Refuse TP>1 BEFORE anything touches KV or the GDN state. The LM head's post-all-gather
+        # path branches on ``bs == 1`` (the REQUEST count) and flattens the gathered logits to a
+        # single row -- correct for a normal prefill, which has already sliced to one row per
+        # request, but a verify keeps every checked position, so a 1-request/2-position verify
+        # would come back as one row mixing both positions across ranks. Caught downstream by the
+        # row assert, except by then the forward has already advanced KV and GDN in place and the
+        # caller has no clean state to roll back to. Phase 1 is TP=1; shaping the gather by the
+        # real logits row count instead of the request count is the fix if TP is wanted.
+        assert self.tp_info.size == 1, (
+            f"Phase 1 verify is TP=1 only (tp_size={self.tp_info.size}): the LM head's all-gather "
+            "reshape keys on the request count, so a multi-position verify collapses to one row"
+        )
         assert batch.is_prefill, "verify runs in the extend shape; decode is 1 token/request"
         assert batch.size == 1, "Phase 1 verifies a single request"
         assert batch.padded_size == batch.size, "verify returns real rows only; do not pad"
