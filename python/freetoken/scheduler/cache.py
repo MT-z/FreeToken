@@ -43,7 +43,8 @@ _SWA_RETAIN_GAP = 16
 
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
-                 linear_state_pool=None, swa_pool=None, sliding_window_size=None):
+                 linear_state_pool=None, swa_pool=None, sliding_window_size=None,
+                 track_slots: int = 2):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -56,6 +57,9 @@ class CacheManager:
         self.swa_pool = swa_pool
         self.sliding_window_size = sliding_window_size
         self.is_hybrid = type == "hybrid_radix"
+        # Donate-ring length (hybrid GDN): how many prefill-chunk snapshots one request can hand
+        # to the tree. 2 is the floor the overlap needs -- one face frozen, one being written.
+        self.track_slots = max(2, int(track_slots))
         self.is_swa = type == "swa_radix"
         # swa_paged: this SWA model drives the global-paged swa pool -- true for BOTH the naive
         # (NaivePrefixCache, no reuse) and radix (SWARadixCache) paths. Gates the swa slot
@@ -176,16 +180,19 @@ class CacheManager:
             a = r.toolcall_anchor_len
             if (
                 a is None
-                or r.mamba_ping_pong is None
+                or r.mamba_track_slots is None
                 or r.mamba_last_track_seqlen is not None
                 or r.cached_len != a
                 or align_down(a, self.page_size) != a
             ):
                 continue
-            dst = r.mamba_ping_pong[r.mamba_next_track_idx]
+            dst = r.mamba_track_slots[r.mamba_next_track_idx]
             pool.copy_from(r.linear_slot_idx, dst)
+            seqlens = list(r.mamba_track_seqlens)
+            seqlens[r.mamba_next_track_idx] = a
+            r.mamba_track_seqlens = tuple(seqlens)
             r.mamba_last_track_seqlen = a
-            r.mamba_next_track_idx = 1 - r.mamba_next_track_idx
+            r.mamba_next_track_idx = (r.mamba_next_track_idx + 1) % len(r.mamba_track_slots)
 
     def maybe_free_swa_out_of_window(self, reqs: List[Req], *, forward_iter: int) -> None:
         """Proactively free each decoding request's now-out-of-window SWA slots, bounding its swa
@@ -355,12 +362,11 @@ class CacheManager:
 
     def _cache_req_hybrid(self, req: Req, *, finished: bool) -> None:
         """Hybrid (GDN) cache_req: commit KV like radix AND manage the GDN state snapshot.
-        Prefill chunk commit: donate a PRIVATE CLONE of the frozen ping-pong slot (the
-        snapshot the forward wrote at the tracked ×64 boundary mamba_last_track_seqlen)
-        into the tree, and -- for a chunked prompt -- a clone of the OTHER face too (the
-        boundary the previous chunk tracked, mamba_prev_track_seqlen, which intermediate
-        chunks never commit); the request keeps its own slots. Finish: donate a clone of the
-        live slot (final full-sequence state) and free all of the req's slots."""
+        Prefill chunk commit: donate a PRIVATE CLONE of every donate-ring face that holds a
+        tracked ×64 boundary (intermediate chunks never commit, so the ring is where a chunked
+        prompt's earlier boundaries have been accumulating); the request keeps its own slots.
+        Finish: donate a clone of the live slot (final full-sequence state) and free all of the
+        req's slots."""
         from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
 
         pool = self.linear_state_pool
@@ -381,18 +387,19 @@ class CacheManager:
                 L is not None
                 and 0 < L <= req.cached_len
                 and align_down(L, self.page_size) == L
-                and req.mamba_ping_pong is not None
+                and req.mamba_track_slots is not None
             ):
-                frozen_idx = 1 - req.mamba_next_track_idx
-                frozen = req.mamba_ping_pong[frozen_idx]
+                frozen_idx = (req.mamba_next_track_idx - 1) % len(req.mamba_track_slots)
+                frozen = req.mamba_track_slots[frozen_idx]
                 clone = self._clone_slot_for_tree(frozen)
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     req.input_ids[:L], page_indices[:L], clone)
                 _pfx(f"insert[frozen] L={L} -> prefix_len={prefix_len} mamba_exist={mamba_exist}")
                 if mamba_exist:
                     pool.free(clone)  # node already had a snapshot; clone unused
-                pool.free(list(req.mamba_ping_pong))
-                req.mamba_ping_pong = None
+                pool.free(list(req.mamba_track_slots))
+                req.mamba_track_slots = None
+                req.mamba_track_seqlens = None
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
                 free_upto = max(free_upto, L)
             # Donate the live slot (final full-sequence state). The live state is at cached_len;
@@ -419,38 +426,39 @@ class CacheManager:
             self._free_req_slots(req, keep_live=keep_live)
             return
 
-        # Prefill chunk commit: donate the frozen snapshot at the tracked ×64 boundary -- and,
-        # for a chunked prompt, the boundary the PREVIOUS chunk tracked into the other face.
-        # Intermediate chunks skip cache_req (scheduler: overlap double-free), so that face is
-        # otherwise the only copy and gets overwritten two tracks later. Without it, a branch
-        # anywhere inside the final chunk finds no live snapshot at or before its divergence and
-        # re-prefills the whole prompt (measured: 0 reuse at 96k while 120k reused 119,808).
-        L = req.mamba_last_track_seqlen
-        P = req.mamba_prev_track_seqlen
-        req.mamba_prev_track_seqlen = None  # donatable only here; consumed or dropped below
-        if L is not None and align_down(L, self.page_size) != L:
-            # page_size>1 only: insert would align the key down, attaching a state that encodes
-            # L tokens to a SHORTER node -- a future hit would COW-restore an over-advanced
-            # state. Skip; the next aligned boundary (or the finish-donate) commits instead.
-            req.mamba_last_track_seqlen = None
-            L = None
-        donations: list[tuple[int, int]] = []  # (boundary, slot), shortest first
-        if (
-            P is not None
-            and req.mamba_ping_pong is not None
-            and (L is None or P < L)
-            and 0 < P <= req.cached_len
-            and align_down(P, self.page_size) == P
+        # Prefill chunk commit. Intermediate chunks skip cache_req (scheduler: overlap
+        # double-free), so a boundary they tracked exists only in its ring face until this
+        # commit. Donate EVERY ring face that still holds a committable boundary -- shortest first, which
+        # is what the dedup floor below assumes. Each face's recorded boundary always describes
+        # its current contents (the forward writes slot and seqlen together), so a face survives
+        # exactly until the ring wraps back onto it: the ring length is how many prefill-chunk
+        # boundaries a request can hand over. A boundary that is not page-aligned is skipped
+        # (page_size>1 only): insert would align the key down and attach a state encoding MORE
+        # tokens than the node it lands on, so a future hit would COW-restore an over-advanced
+        # state. The next aligned boundary (or the finish-donate) commits instead.
+        if req.mamba_last_track_seqlen is not None and (
+            align_down(req.mamba_last_track_seqlen, self.page_size) != req.mamba_last_track_seqlen
         ):
-            # The face the forward did NOT write this chunk: after this chunk's write flipped
-            # next away from it that is ping_pong[next]; with no boundary crossed this chunk
-            # (no write, no flip) it is still ping_pong[1 - next].
-            prev_idx = req.mamba_next_track_idx if L is not None else 1 - req.mamba_next_track_idx
-            donations.append((P, req.mamba_ping_pong[prev_idx]))
-        if L is not None:
-            donations.append((L, req.mamba_ping_pong[1 - req.mamba_next_track_idx]))
+            req.mamba_last_track_seqlen = None  # unaligned: skipped here and at the finish-donate
+        donations: list[tuple[int, int]] = []  # (boundary, slot), shortest first
+        if req.mamba_track_slots is not None and req.mamba_track_seqlens is not None:
+            usable, seen = [], set()
+            for b, slot in zip(req.mamba_track_seqlens, req.mamba_track_slots):
+                if b is None or not (0 < b <= req.cached_len):
+                    continue
+                if align_down(b, self.page_size) != b:
+                    continue  # never becomes aligned; dropped with the rest of the ring below
+                if b in seen:  # two faces landed on the same boundary: one clone is enough
+                    continue
+                seen.add(b)
+                usable.append((b, slot))
+            donations = sorted(usable)
+            # Consumed either way: a donated face is in the tree as a private clone, and an
+            # unusable one never becomes usable. A later freeze (the tool-call anchor during
+            # decode) re-arms the ring for the finish-donate.
+            req.mamba_track_seqlens = (None,) * len(req.mamba_track_slots)
         if not donations:
-            return  # no ×64 boundary crossed this chunk; req keeps its pages (committed later)
+            return  # no ×64 boundary crossed this prefill; req keeps its pages (committed later)
         dedup_len: int | None = None
         for boundary, slot in donations:
             clone = self._clone_slot_for_tree(slot)
@@ -569,15 +577,16 @@ class CacheManager:
         return self.page_table[req.table_idx, start:end]
 
     def _free_req_slots(self, req: Req, keep_live: bool = False) -> None:
-        """Return a finished request's GDN pool slots: both ping-pong slots, plus the live slot
+        """Return a finished request's GDN pool slots: every donate-ring slot, plus the live slot
         unless it was donated to the tree. Idempotent -- clears the refs so a re-entry frees
         nothing (defense-in-depth against the abort/finish double-free, see _free_req_resources)."""
-        slots = list(req.mamba_ping_pong) if req.mamba_ping_pong is not None else []
+        slots = list(req.mamba_track_slots) if req.mamba_track_slots is not None else []
         if not keep_live and req.linear_slot_idx is not None:
             slots.append(req.linear_slot_idx)
         if slots:
             self.linear_state_pool.free(slots)
-        req.mamba_ping_pong = None
+        req.mamba_track_slots = None
+        req.mamba_track_seqlens = None
         req.linear_slot_idx = None
 
     def check_integrity(self) -> None:

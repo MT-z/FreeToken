@@ -70,7 +70,8 @@ def test_hybrid_unfinished_commit_repoints_the_row_off_the_freed_pages():
     for idx in (0, 1):
         r = _admit(cm, page_table, idx, PROMPT, cm.match_req(_pend(PROMPT)).cuda_handle)
         r.linear_slot_idx = pool.alloc(1)[0]
-        r.mamba_ping_pong = tuple(pool.alloc(2))
+        r.mamba_track_slots = tuple(pool.alloc(2))
+        r.mamba_track_seqlens = (None, None)
         r.mamba_next_track_idx = 1
         r.mamba_last_track_seqlen = len(PROMPT)
         reqs.append(r)

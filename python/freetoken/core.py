@@ -91,14 +91,17 @@ class Req:
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---
     linear_slot_idx: int | None = None              # live GDN state slot (sglang mamba_pool_idx)
-    mamba_ping_pong: tuple[int, int] | None = None  # 2 donatable track slots under overlap
-    mamba_next_track_idx: int = 0                   # which ping-pong slot is the next snapshot dst (0/1)
+    # Donatable track slots, used as a RING: each prefill forward writes its ×64 snapshot into
+    # mamba_track_slots[mamba_next_track_idx] and advances. Intermediate chunks skip cache_req
+    # (scheduler: overlap double-free), so a face is only handed to the tree at the final chunk's
+    # commit -- which means the ring length is exactly how many prefill-chunk boundaries survive
+    # to be donated. Two faces (the old ping-pong) keep only the last two, and a branch before
+    # them finds no live snapshot and re-prefills the whole prompt.
+    mamba_track_slots: tuple[int, ...] | None = None
+    mamba_next_track_idx: int = 0                   # next snapshot dst in the ring
+    # Boundary recorded in each face, parallel to mamba_track_slots; None = face never written.
+    mamba_track_seqlens: tuple[int | None, ...] | None = None
     mamba_last_track_seqlen: int | None = None      # chunk-aligned committed len of the last snapshot
-    # ×64 boundary the PREVIOUS prefill chunk tracked into the other ping-pong slot and never
-    # committed (intermediate chunks skip cache_req). Carried onto the continuation so the final
-    # chunk's commit can donate that face too -- a branch inside the final chunk then reuses up to
-    # one chunk earlier instead of finding no live snapshot at all.
-    mamba_prev_track_seqlen: int | None = None
     # Fork length: the tree matched this request's tokens up to here (tok_match) but its deepest
     # live snapshot was shorter, so [cached_len, fork) is re-prefilled. The prefill chunk that
     # spans it tracks its ×64 snapshot AT the fork instead of at the chunk's deepest boundary,

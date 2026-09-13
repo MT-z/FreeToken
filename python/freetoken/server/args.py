@@ -400,6 +400,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--prefill-snapshot-slots",
+        type=int,
+        dest="mamba_track_slots",
+        default=ServerArgs.mamba_track_slots,
+        help=(
+            "Hybrid (GDN) models: how many prefill-chunk state snapshots one request can hand to "
+            "the prefix cache. Raising it lets a later request branch further back before the "
+            "prefix cache gives up and re-prefills the whole prompt; costs one GDN state slot per "
+            "running request per snapshot. Minimum 2."
+        ),
+    )
+
+    parser.add_argument(
         "--max-prefill-length",
         "--max-extend-length",
         type=int,

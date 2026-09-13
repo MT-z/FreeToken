@@ -77,6 +77,14 @@ class EngineConfig:
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
     linear_state_cache_ratio: float = 2.0
+    # How many prefill-chunk GDN snapshots one request can hand to the prefix cache. Each prefill
+    # forward writes its ×64 snapshot into a ring of this many slots; intermediate chunks skip
+    # cache_req (scheduler: overlap double-free), so only the faces still holding a distinct
+    # boundary at the FINAL chunk's commit get donated. At 2 (the old ping-pong) a prompt of C
+    # chunks donates only its last two boundaries, so a branch before
+    # floor(prompt/chunk)*chunk - 64 finds no live snapshot and re-prefills everything. Costs one
+    # LinearStatePool slot per running request per face; 2 is the floor the overlap needs.
+    mamba_track_slots: int = 8
     # Window/full ratio for the SWA radix cache (`--cache-type radix` on SWA models) and the DSV4
     # window tier: the DEFAULT window-pool size = max(working-set floor, ratio x full-pool tokens).
     # < 1.0 trades retained window-prefix capacity for memory savings; must be in (0, 1]. It is the

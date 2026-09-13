@@ -124,7 +124,7 @@ def rig(monkeypatch):
 def _req(device_len, cached_len):
     return SimpleNamespace(
         table_idx=0, device_len=device_len, extend_len=device_len - cached_len,
-        cached_len=cached_len, linear_slot_idx=1, mamba_ping_pong=None,
+        cached_len=cached_len, linear_slot_idx=1, mamba_track_slots=None,
     )
 
 

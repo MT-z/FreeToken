@@ -88,13 +88,14 @@ class PrefillAdder:
         if estimated_size + self.reserved_size > self.cache_manager.available_size:
             return self.cache_manager.unlock(handle)
 
-        # Second currency (hybrid GDN): reserve 1 live + 2 ping-pong state slots; evict tree
-        # snapshots if the pool is short, fail admission if still short (mirrors the KV gate).
+        # Second currency (hybrid GDN): reserve 1 live + the donate ring; evict tree snapshots if
+        # the pool is short, fail admission if still short (mirrors the KV gate).
         if self.cache_manager.is_hybrid:
             pool = self.cache_manager.linear_state_pool
-            if pool.num_free_slots < 3:
-                self.cache_manager.ensure_mamba_slots(3)
-            if pool.num_free_slots < 3:
+            need = 1 + self.cache_manager.track_slots
+            if pool.num_free_slots < need:
+                self.cache_manager.ensure_mamba_slots(need)
+            if pool.num_free_slots < need:
                 return self.cache_manager.unlock(handle)
 
         # Third currency (SWA): refuse admission unless the swa pool can seat this request's first
@@ -124,19 +125,19 @@ class PrefillAdder:
             n = int(matched.numel())
             self.table_manager.page_table[table_idx][cached_len - n : cached_len].copy_(matched)
 
-        linear_slot_idx = ping_pong = None
+        linear_slot_idx = track_slots = None
         if self.cache_manager.is_hybrid:
             pool = self.cache_manager.linear_state_pool
             linear_slot_idx = pool.alloc(1)[0]
-            ping_pong = tuple(pool.alloc(2))
+            track_slots = tuple(pool.alloc(self.cache_manager.track_slots))
 
         # Fork: the tree matched more tokens than it could hand over (no live snapshot at
         # them). Remember where, so the chunk that re-prefills across it tracks a snapshot
         # there for the next request branching at the same point.
         fork_len = None
-        if ping_pong is not None and mr.tok_match is not None and mr.tok_match > cached_len:
+        if track_slots is not None and mr.tok_match is not None and mr.tok_match > cached_len:
             fork_len = mr.tok_match
-        return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value, fork_len
+        return handle, table_idx, linear_slot_idx, track_slots, mr.mamba_value, fork_len
 
     def _add_one_req(
         self,
@@ -145,12 +146,12 @@ class PrefillAdder:
         table_idx: int,
         cached_len: int,
         linear_slot_idx: int | None = None,
-        ping_pong: tuple | None = None,
+        track_slots: tuple | None = None,
+        track_seqlens: tuple | None = None,
         next_track_idx: int = 0,
         restore_src: int | None = None,
         swa_evicted_seqlen: int = 0,
         chunked_req: Req | None = None,
-        prev_track_seqlen: int | None = None,
         fork_len: int | None = None,
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
@@ -222,9 +223,14 @@ class PrefillAdder:
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
         req.linear_slot_idx = linear_slot_idx
-        req.mamba_ping_pong = ping_pong
+        req.mamba_track_slots = track_slots
         req.mamba_next_track_idx = next_track_idx
-        req.mamba_prev_track_seqlen = prev_track_seqlen
+        # Fresh admit: no face has been written yet. Continuation: inherit the ring as it stands,
+        # so every boundary an intermediate chunk tracked is still addressable at the final commit.
+        req.mamba_track_seqlens = (
+            track_seqlens if track_seqlens is not None
+            else (None,) * len(track_slots) if track_slots is not None else None
+        )
         req.mamba_fork_len = fork_len
         req.mamba_restore_src = restore_src
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
@@ -241,31 +247,24 @@ class PrefillAdder:
                 table_idx=chunked_req.table_idx,
                 cached_len=chunked_req.cached_len,
                 linear_slot_idx=chunked_req.linear_slot_idx,
-                ping_pong=chunked_req.mamba_ping_pong,
+                track_slots=chunked_req.mamba_track_slots,
+                track_seqlens=chunked_req.mamba_track_seqlens,
                 next_track_idx=chunked_req.mamba_next_track_idx,
                 restore_src=None,  # continuation chunk already has live state
                 swa_evicted_seqlen=chunked_req.swa_evicted_seqlen,  # extend-free watermark so far
                 chunked_req=chunked_req,
-                # The chunk that just ran skipped cache_req (scheduler: overlap double-free), so
-                # the ×64 boundary it tracked is still only in its ping-pong slot. Hand it on; if
-                # this chunk crossed no boundary the older carried one is still the face's state.
-                prev_track_seqlen=(
-                    chunked_req.mamba_last_track_seqlen
-                    if chunked_req.mamba_last_track_seqlen is not None
-                    else chunked_req.mamba_prev_track_seqlen
-                ),
                 fork_len=chunked_req.mamba_fork_len,  # still ahead of us, or already consumed (None)
             )
 
         if resource := self._try_allocate_one(pending_req):
-            cache_handle, table_idx, linear_slot_idx, ping_pong, restore_src, fork_len = resource
+            cache_handle, table_idx, linear_slot_idx, track_slots, restore_src, fork_len = resource
             req = self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=cache_handle,
                 table_idx=table_idx,
                 cached_len=cache_handle.cached_len,
                 linear_slot_idx=linear_slot_idx,
-                ping_pong=ping_pong,
+                track_slots=track_slots,
                 next_track_idx=0,
                 restore_src=restore_src,
                 fork_len=fork_len,
@@ -276,7 +275,7 @@ class PrefillAdder:
                 self.cache_manager.unlock(cache_handle)
                 self.table_manager.free(table_idx)
                 if linear_slot_idx is not None:
-                    self.cache_manager.linear_state_pool.free([linear_slot_idx, *ping_pong])
+                    self.cache_manager.linear_state_pool.free([linear_slot_idx, *track_slots])
             return req
 
         return None

@@ -84,7 +84,8 @@ def _launch_req(pool, cm, tm, prompt, *, cls=Req, track_seqlen=None):
               uid=UID, sampling_params=SamplingParams(max_tokens=4),
               cache_handle=mr.cuda_handle)
     req.linear_slot_idx = pool.alloc(1)[0]
-    req.mamba_ping_pong = tuple(pool.alloc(2))
+    req.mamba_track_slots = tuple(pool.alloc(2))
+    req.mamba_track_seqlens = (None, None)
     req.mamba_next_track_idx = 1
     cm.lock(mr.cuda_handle)
     cm.allocate_paged([req])
@@ -120,7 +121,7 @@ def test_abort_inflight_final_chunk_marks_then_drains():
 
     Scheduler._process_one_msg(stub, AbortBackendMsg(uid=UID))
     assert req.aborted and req.table_idx != -1  # marked, NOT freed under the forward
-    assert req.mamba_ping_pong is not None
+    assert req.mamba_track_slots is not None
     assert req not in dm.running_reqs
     assert UID in stub._pending_abort_acks
     free_after_mark = pool.num_free_slots
@@ -189,7 +190,7 @@ def test_prefix_commit_sentinel_guard():
     aborted = dm.abort_req(UID)
     assert aborted is req
     Scheduler._free_req_resources(stub, aborted)   # freed WITHOUT the aborted mark
-    assert req.table_idx == -1 and req.mamba_ping_pong is None
+    assert req.table_idx == -1 and req.mamba_track_slots is None
     free_after_abort = pool.num_free_slots
 
     Scheduler._process_last_data(stub, _as_last_data(batch))  # pre-guard: TypeError

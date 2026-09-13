@@ -142,19 +142,22 @@ def test_hybrid_chunk_donate_skips_unaligned_boundary(ps):
     cm.allocate_paged([req])
     req.complete_one()
     req.linear_slot_idx = pool.alloc(1)[0]
-    req.mamba_ping_pong = (pool.alloc(1)[0], pool.alloc(1)[0])
+    req.mamba_track_slots = (pool.alloc(1)[0], pool.alloc(1)[0])
+    req.mamba_track_seqlens = (None, None)
     req.mamba_next_track_idx = 0
 
     # Unaligned x64 boundary: the donate must be SKIPPED (state would attach to a shorter node).
     req.mamba_last_track_seqlen = 2 * ps + 3
-    pp_before = req.mamba_ping_pong
+    req.mamba_track_seqlens = (2 * ps + 3, None)
+    pp_before = req.mamba_track_slots
     cm.cache_req(req, finished=False)
     assert req.mamba_last_track_seqlen is None
-    assert req.mamba_ping_pong == pp_before          # frozen slot NOT replaced -> no donate
+    assert req.mamba_track_slots == pp_before        # frozen slot NOT replaced -> no donate
     assert req.cache_handle is h                     # handle NOT re-pointed -> donate skipped
 
     # Aligned boundary on the same request: the donate goes through.
     req.mamba_last_track_seqlen = 2 * ps
+    req.mamba_track_seqlens = (2 * ps, None)   # the forward writes face and boundary together
     cm.cache_req(req, finished=False)
     assert req.cache_handle is not h                 # re-matched + locked on the committed node
     assert req.cache_handle.cached_len == 2 * ps

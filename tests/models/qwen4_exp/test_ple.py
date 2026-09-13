@@ -536,7 +536,8 @@ def _track_batch(req, tokens, pool):
 def _tracked_req(table_idx, cached_len, tokens, *, live, ping_pong):
     req = _req(table_idx, cached_len, tokens, extend_len=len(tokens))
     req.linear_slot_idx = live
-    req.mamba_ping_pong = ping_pong
+    req.mamba_track_slots = ping_pong
+    req.mamba_track_seqlens = (None,) * len(ping_pong)
     req.mamba_next_track_idx = 0
     return req
 

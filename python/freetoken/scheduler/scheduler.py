@@ -89,6 +89,7 @@ class Scheduler(SchedulerIOMixin):
                 (g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa),
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
+            track_slots=getattr(config, "mamba_track_slots", 2),
         )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
@@ -321,9 +322,9 @@ class Scheduler(SchedulerIOMixin):
                     # Don't cache intermediate chunks; the full prompt is cached once when the
                     # final chunk is processed. Caching here snapshots a handle the next chunk
                     # already copied (overlap), so cache_req double-frees the prior chunk.
-                    # The ×64 boundary this chunk tracked is not lost: PrefillAdder carries it
-                    # onto the continuation as mamba_prev_track_seqlen and the final chunk's
-                    # commit donates that ping-pong face alongside its own.
+                    # The ×64 boundary this chunk tracked is not lost: it stays in the donate
+                    # ring (PrefillAdder hands the ring to the continuation) and the final
+                    # chunk's commit donates every face that still holds one.
                     if req.aborted:
                         # Aborted mid-chunked-prefill while this chunk was in flight: the abort
                         # popped the pending continuation (no next chunk launches), and this

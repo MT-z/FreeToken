@@ -94,10 +94,10 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
 def _build_track_metadata(reqs, cu_host, device, pin):
     """Hybrid-radix (extra_buffer): for each request that crosses a ×CHUNK boundary this
     prefill forward, snapshot its GDN state at the deepest mid-chunk boundary into its current
-    ping-pong slot. Returns the ``FLAMetadata`` track kwargs, all None when no request
+    ring slot. Returns the ``FLAMetadata`` track kwargs, all None when no request
     tracks (non-hybrid, or all extends < CHUNK+1)."""
     empty = dict(track_dst=None, track_h_row=None, track_conv_src=None, track_boundary_row=None)
-    if not any(r.mamba_ping_pong is not None for r in reqs):
+    if not any(r.mamba_track_slots is not None for r in reqs):
         return empty
     from freetoken.core import get_global_ctx
     from freetoken.kernel.fla.chunk import CHUNK_SIZE
@@ -111,7 +111,7 @@ def _build_track_metadata(reqs, cu_host, device, pin):
     boh = prepare_chunk_offsets(cu_host, CHUNK_SIZE).tolist()
     dst, h_row, conv_src, boundary_rows = [], [], [], []
     for i, r in enumerate(reqs):
-        if r.mamba_ping_pong is None:
+        if r.mamba_track_slots is None:
             continue
         # deepest mid-chunk boundary strictly inside the extend (h has the per-chunk state;
         # the exact extend-end / aligned-final state lives in the live slot -> finish-donate).
@@ -125,8 +125,8 @@ def _build_track_metadata(reqs, cu_host, device, pin):
             # one: the request re-prefills these tokens anyway, and a snapshot there is
             # exactly what the next request branching at the same point can resume from.
             # Costs nothing extra -- h already holds every per-chunk state of the extend.
-            # Whether the face survives to the final-chunk commit follows from the two
-            # ping-pong slots: it does if this is the final or the previous chunk.
+            # Whether the face survives to the final-chunk commit follows from the ring
+            # length: it does unless the ring wraps back onto this face first.
             cf = (fork - r.cached_len) // CHUNK_SIZE
             if cf >= 1:
                 c = cf
@@ -134,12 +134,18 @@ def _build_track_metadata(reqs, cu_host, device, pin):
             r.mamba_fork_len = None  # consumed (or unreachable); later chunks track as usual
         off = int(cu_host[i])
         boundary = r.cached_len + c * CHUNK_SIZE
-        dst.append(r.mamba_ping_pong[r.mamba_next_track_idx])
+        dst.append(r.mamba_track_slots[r.mamba_next_track_idx])
         h_row.append(boh[i] + c)
         conv_src.append([off + c * CHUNK_SIZE - km1 + j for j in range(km1)])
         boundary_rows.append(off + c * CHUNK_SIZE)
+        # Record the boundary IN the face we are about to overwrite, then advance the ring. The
+        # face keeps its boundary until the ring wraps onto it again, so the final chunk's commit
+        # can donate every face that still holds a distinct prefill-chunk snapshot.
+        seqlens = list(r.mamba_track_seqlens)
+        seqlens[r.mamba_next_track_idx] = boundary
+        r.mamba_track_seqlens = tuple(seqlens)
         r.mamba_last_track_seqlen = boundary
-        r.mamba_next_track_idx = 1 - r.mamba_next_track_idx
+        r.mamba_next_track_idx = (r.mamba_next_track_idx + 1) % len(r.mamba_track_slots)
     if not dst:
         return empty
     to = lambda xs, **kw: torch.tensor(xs, **pin, **kw).to(device, non_blocking=True)

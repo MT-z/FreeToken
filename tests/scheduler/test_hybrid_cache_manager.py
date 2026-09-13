@@ -44,8 +44,10 @@ def test_hybrid_cache_manager_donate_then_hit():
     reqA = Req(input_ids=torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32), table_idx=0,
                cached_len=4, output_len=1, uid=0, sampling_params=SamplingParams(),
                cache_handle=mr.cuda_handle)
-    reqA.linear_slot_idx, reqA.mamba_ping_pong = live, pp
-    reqA.mamba_next_track_idx = 1            # flipped from 0 in build_fla_metadata; frozen = pp[0]
+    reqA.linear_slot_idx, reqA.mamba_track_slots = live, pp
+    reqA.mamba_track_seqlens = (None,) * len(pp)
+    reqA.mamba_next_track_idx = 1            # advanced from 0 in build_fla_metadata; face 0 holds it
+    reqA.mamba_track_seqlens = (4, None)
     reqA.mamba_last_track_seqlen = 4
     cm.lock(mr.cuda_handle)
 
@@ -58,7 +60,7 @@ def test_hybrid_cache_manager_donate_then_hit():
     clone_ids = clone_before - set(pool._free_slots)
     assert len(clone_ids) == 1
     clone_id = next(iter(clone_ids))
-    assert reqA.mamba_ping_pong[0] == pp[0]        # request keeps its own slot (no replacement alloc)
+    assert reqA.mamba_track_slots[0] == pp[0]      # request keeps its own slot (no replacement alloc)
 
     # req B shares the [1,2,3,4] prefix -> HIT: the tree's snapshot is the private CLONE,
     # not the request's own slot.
@@ -79,7 +81,8 @@ def test_hybrid_finish_donates_live_slot():
     req = Req(input_ids=torch.tensor([7, 8, 9, 10], dtype=torch.int32), table_idx=1,
               cached_len=3, output_len=1, uid=1, sampling_params=SamplingParams(),
               cache_handle=mr.cuda_handle)
-    req.linear_slot_idx, req.mamba_ping_pong = live, pp
+    req.linear_slot_idx, req.mamba_track_slots = live, pp
+    req.mamba_track_seqlens = (None,) * len(pp)
     cm.lock(mr.cuda_handle)
 
     clone_before = set(pool._free_slots)
@@ -101,7 +104,8 @@ def test_free_req_slots_idempotent():
     live, pp = pool.alloc(1)[0], tuple(pool.alloc(2))
     req = Req(input_ids=torch.tensor([1, 2, 3], dtype=torch.int32), table_idx=0, cached_len=2,
               output_len=1, uid=0, sampling_params=SamplingParams(), cache_handle=None)
-    req.linear_slot_idx, req.mamba_ping_pong = live, pp
+    req.linear_slot_idx, req.mamba_track_slots = live, pp
+    req.mamba_track_seqlens = (None,) * len(pp)
     base = pool.num_free_slots
     cm._free_req_slots(req)
     assert pool.num_free_slots == base + 3        # live + 2 ping-pong returned once
@@ -119,7 +123,8 @@ def test_rebuild_reclaims_donated_gdn_slots():
     pt[1, :3] = torch.tensor([200, 201, 202], dtype=torch.int32)
     req = Req(input_ids=torch.tensor([7, 8, 9, 10], dtype=torch.int32), table_idx=1, cached_len=3,
               output_len=1, uid=1, sampling_params=SamplingParams(), cache_handle=mr.cuda_handle)
-    req.linear_slot_idx, req.mamba_ping_pong = live, pp
+    req.linear_slot_idx, req.mamba_track_slots = live, pp
+    req.mamba_track_seqlens = (None,) * len(pp)
     cm.lock(mr.cuda_handle)
     cm.cache_req(req, finished=True)              # donates `live` to the tree, frees ping-pong
     assert pool.num_free_slots < pool.num_slots - 1   # a slot is now tree-owned
@@ -201,14 +206,15 @@ def _admit_cold(cm, pool, pt, ids, row):
               output_len=1, uid=row, sampling_params=SamplingParams(), cache_handle=mr.cuda_handle)
     req.complete_one()                            # the prefill forward ran: cached_len == len(ids)
     assert req.cached_len == len(ids)
-    req.linear_slot_idx, req.mamba_ping_pong = live, pp
+    req.linear_slot_idx, req.mamba_track_slots = live, pp
+    req.mamba_track_seqlens = (None,) * len(pp)
     cm.lock(mr.cuda_handle)
     return req, pp, pages.tolist()
 
 
 def test_hybrid_chunk_commit_donates_the_previous_face_too():
     """Chunked prompt [0,6)+[6,10): chunk 1 tracked boundary 4 into face 0 and skipped cache_req
-    (the continuation carried it as mamba_prev_track_seqlen); chunk 2 tracked boundary 8 into
+    (the continuation carried the ring); chunk 2 tracked boundary 8 into
     face 1. The final-chunk commit must donate BOTH faces, so a branch inside the final chunk
     (divergence at 6) reuses up to 4 instead of finding no live snapshot at all."""
     pool = _pool()
@@ -216,15 +222,15 @@ def test_hybrid_chunk_commit_donates_the_previous_face_too():
     cm = CacheManager(64, 1, pt, "hybrid_radix", linear_state_pool=pool)
     ids = list(range(1, 11))
     req, pp, pages = _admit_cold(cm, pool, pt, ids, row=0)
-    req.mamba_prev_track_seqlen = 4      # face 0 (written by chunk 1, next 0 -> 1)
-    req.mamba_last_track_seqlen = 8      # face 1 (written by chunk 2, next 1 -> 0)
+    req.mamba_track_seqlens = (4, 8)     # face 0 <- chunk 1, face 1 <- chunk 2
+    req.mamba_last_track_seqlen = 8
     req.mamba_next_track_idx = 0
     free_slots_before, free_pages_before = pool.num_free_slots, len(cm.free_slots)
     cm.cache_req(req, finished=False)
     assert pool.num_free_slots == free_slots_before - 2      # two private clones, nothing else
     assert len(cm.free_slots) == free_pages_before            # cold tree: no dup pages to free
-    assert req.mamba_ping_pong == pp                          # request keeps both faces
-    assert req.mamba_prev_track_seqlen is None and req.mamba_last_track_seqlen is None
+    assert req.mamba_track_slots == pp                        # request keeps both faces
+    assert req.mamba_track_seqlens == (None, None) and req.mamba_last_track_seqlen is None
     assert req.cache_handle.cached_len == 8
     # branch inside the final chunk -> the previous face's boundary
     m4 = cm.match_req(_pend(ids[:6] + [99]))
@@ -251,14 +257,14 @@ def test_hybrid_chunk_commit_donates_only_the_previous_face_when_the_final_chunk
     cm = CacheManager(64, 1, pt, "hybrid_radix", linear_state_pool=pool)
     ids = list(range(1, 11))
     req, _pp, _pages = _admit_cold(cm, pool, pt, ids, row=0)
-    req.mamba_prev_track_seqlen = 4      # face 0 (chunk 1 wrote it, next 0 -> 1); no write since
+    req.mamba_track_seqlens = (4, None)  # face 0 (chunk 1 wrote it); no write since
     req.mamba_last_track_seqlen = None
     req.mamba_next_track_idx = 1
     free_before = pool.num_free_slots
     cm.cache_req(req, finished=False)
     assert pool.num_free_slots == free_before - 1
     assert req.cache_handle.cached_len == 4
-    assert req.mamba_prev_track_seqlen is None
+    assert req.mamba_track_seqlens == (None, None)
     m = cm.match_req(_pend(ids[:6] + [99]))
     assert m.cuda_handle.cached_len == 4 and _slot_val(pool, m.mamba_value) == 1.0
     cm.cache_req(req, finished=True)
@@ -279,10 +285,10 @@ def test_hybrid_chunk_commit_dedup_floor_with_a_pre_existing_shorter_branch():
     reqA, _ppA, pagesA = _admit_cold(cm, pool, pt, ids, row=0)
     # B: [1..4] with a tracked boundary at 3, committed while A is still in flight
     reqB, _ppB, pagesB = _admit_cold(cm, pool, pt, ids[:4], row=1)
-    reqB.mamba_last_track_seqlen, reqB.mamba_next_track_idx = 3, 1
+    reqB.mamba_track_seqlens, reqB.mamba_last_track_seqlen, reqB.mamba_next_track_idx = (3, None), 3, 1
     cm.cache_req(reqB, finished=False)
     assert cm.match_req(_pend(ids[:6] + [99])).cuda_handle.cached_len == 3
-    reqA.mamba_prev_track_seqlen, reqA.mamba_last_track_seqlen, reqA.mamba_next_track_idx = 4, 8, 0
+    reqA.mamba_track_seqlens, reqA.mamba_last_track_seqlen, reqA.mamba_next_track_idx = (4, 8), 8, 0
     free_slots_before, free_pages_before = pool.num_free_slots, len(cm.free_slots)
     cm.cache_req(reqA, finished=False)
     assert pool.num_free_slots == free_slots_before - 2       # both clones taken (new nodes)
@@ -304,8 +310,8 @@ def test_hybrid_chunk_commit_dedup_floor_with_a_pre_existing_shorter_branch():
 
 def test_prefill_continuation_carries_the_uncommitted_track_boundary():
     """The scheduler skips cache_req for intermediate chunks, so the boundary a chunk tracked
-    lives only in its ping-pong face. PrefillAdder must hand it to the continuation as
-    mamba_prev_track_seqlen -- and pass an older one through when a chunk tracked nothing."""
+    lives only in its ring face. PrefillAdder must hand the whole ring to the continuation --
+    including boundaries from chunks older than the one that just ran."""
     from freetoken.scheduler.prefill import ChunkedReq, PrefillAdder
     from freetoken.scheduler.table import TableManager
     from freetoken.scheduler.utils import PendingReq
@@ -322,21 +328,21 @@ def test_prefill_continuation_carries_the_uncommitted_track_boundary():
 
     chunk = add(128)
     assert isinstance(chunk, ChunkedReq) and chunk.extend_len == 128
-    assert chunk.mamba_prev_track_seqlen is None              # fresh admission carries nothing
+    assert chunk.mamba_track_seqlens == (None, None)          # fresh admission carries nothing
     # forward: build_fla_metadata tracked 64 into face 0 and flipped; scheduler skipped cache_req
-    chunk.mamba_last_track_seqlen, chunk.mamba_next_track_idx = 64, 1
+    chunk.mamba_track_seqlens, chunk.mamba_last_track_seqlen, chunk.mamba_next_track_idx = (64, None), 64, 1
     chunk.cached_len = chunk.device_len
     pending.chunked_req = chunk
     cont = add(64)
     assert isinstance(cont, ChunkedReq) and cont.cached_len == 128
-    assert cont.mamba_prev_track_seqlen == 64 and cont.mamba_last_track_seqlen is None
-    assert cont.mamba_next_track_idx == 1 and cont.mamba_ping_pong == chunk.mamba_ping_pong
+    assert cont.mamba_track_seqlens == (64, None) and cont.mamba_last_track_seqlen is None
+    assert cont.mamba_next_track_idx == 1 and cont.mamba_track_slots == chunk.mamba_track_slots
     # this chunk crossed no boundary (extend 64: c = 63 // 64 = 0): the older one passes through
     cont.cached_len = cont.device_len
     pending.chunked_req = cont
     last = add(512)
     assert not isinstance(last, ChunkedReq) and last.cached_len == 192
-    assert last.mamba_prev_track_seqlen == 64 and last.mamba_next_track_idx == 1
+    assert last.mamba_track_seqlens == (64, None) and last.mamba_next_track_idx == 1
 
 
 # ---------------------------------------------------------------- fork-boundary tracking (c)
@@ -350,7 +356,7 @@ def test_match_reports_the_token_match_beyond_the_snapshot_truncation():
     cm = CacheManager(64, 1, pt, "hybrid_radix", linear_state_pool=pool)
     ids = list(range(1, 11))
     req, _pp, _pages = _admit_cold(cm, pool, pt, ids, row=0)
-    req.mamba_prev_track_seqlen, req.mamba_last_track_seqlen, req.mamba_next_track_idx = 4, 8, 0
+    req.mamba_track_seqlens, req.mamba_last_track_seqlen, req.mamba_next_track_idx = (4, 8), 8, 0
     cm.cache_req(req, finished=False)
     m = cm.match_req(_pend(ids[:6] + [99, 100]))          # key = first 7 ids -> matches 6
     assert (m.cuda_handle.cached_len, m.tok_match) == (4, 6)
@@ -373,7 +379,7 @@ def test_prefill_admission_records_the_fork_and_carries_it_across_chunks():
     tm = TableManager(max_running_reqs=8, page_table=pt)
     ids = list(range(1, 11))
     donor, _pp, _pages = _admit_cold(cm, pool, pt, ids, row=0)
-    donor.mamba_prev_track_seqlen, donor.mamba_last_track_seqlen, donor.mamba_next_track_idx = 4, 8, 0
+    donor.mamba_track_seqlens, donor.mamba_last_track_seqlen, donor.mamba_next_track_idx = (4, 8), 8, 0
     cm.cache_req(donor, finished=False)
 
     def admit(prompt, budget):
@@ -412,7 +418,7 @@ def _track_boundary(*, cached_len, extend_len, fork, pool):
     set_global_ctx(Context(page_size=1, linear_state_pool=pool))
     try:
         r = SimpleNamespace(cached_len=cached_len, extend_len=extend_len, mamba_fork_len=fork,
-                            mamba_ping_pong=(1, 2), mamba_next_track_idx=0,
+                            mamba_track_slots=(1, 2), mamba_track_seqlens=(None, None), mamba_next_track_idx=0,
                             mamba_last_track_seqlen=None)
         cu = torch.tensor([0, extend_len], dtype=torch.int32)
         md = _build_track_metadata([r], cu, torch.device("cpu"), {})
@@ -448,3 +454,95 @@ def test_track_boundary_moves_to_the_fork_when_the_extend_spans_it():
     assert T(cached_len=90048, extend_len=6018, fork=90000) == (96064, None)
     # an extend of one GDN chunk or less tracks nothing, fork or not
     assert T(cached_len=96000, extend_len=64, fork=96047) == (None, 96047)
+
+
+# ---------------------------------------------------------------------------
+# Donate ring wider than the old ping-pong. Measured 2026-09-13 on Ornith-1.5-35B: with two
+# faces a 44,362-token prompt donated only 40,896 and 44,352, so a branch before
+# floor(prompt/chunk)*chunk - 64 found no live snapshot and re-prefilled all 44k (TTFT
+# 0.95s -> 8.39s across that one boundary). The ring length is how many chunk boundaries
+# survive to the final commit.
+# ---------------------------------------------------------------------------
+
+def _admit_cold_ring(cm, pool, pt, ids, row, faces):
+    """_admit_cold with an N-face donate ring; face i is filled with the value i+1."""
+    mr = cm.match_req(_pend(ids))
+    assert mr.cuda_handle.cached_len == 0 and mr.mamba_value is None
+    live, ring = pool.alloc(1)[0], tuple(pool.alloc(faces))
+    for i, slot in enumerate(ring):
+        pool.recurrent_states[0, slot].fill_(float(i + 1))
+    pages = cm.free_slots[: len(ids)].clone()
+    cm.free_slots = cm.free_slots[len(ids) :]
+    pt[row, : len(ids)] = pages
+    req = Req(input_ids=torch.tensor(ids, dtype=torch.int32), table_idx=row, cached_len=0,
+              output_len=1, uid=row, sampling_params=SamplingParams(), cache_handle=mr.cuda_handle)
+    req.complete_one()
+    req.linear_slot_idx, req.mamba_track_slots = live, ring
+    req.mamba_track_seqlens = (None,) * faces
+    cm.lock(mr.cuda_handle)
+    return req, ring, pages.tolist()
+
+
+def test_chunk_commit_donates_every_ring_face_not_just_the_last_two():
+    """Four chunks tracked boundaries 2/4/6/8 into a four-face ring. All four must reach the
+    tree: with two faces only 6 and 8 survive and a branch at 3 falls all the way to 0."""
+    pool = _pool(num_slots=32)
+    pt = torch.zeros(4, 64, dtype=torch.int32)
+    cm = CacheManager(64, 1, pt, "hybrid_radix", linear_state_pool=pool, track_slots=4)
+    assert cm.track_slots == 4
+    ids = list(range(1, 11))
+    req, ring, pages = _admit_cold_ring(cm, pool, pt, ids, row=0, faces=4)
+    req.mamba_track_seqlens = (2, 4, 6, 8)   # face i holds boundary 2*(i+1)
+    req.mamba_last_track_seqlen = 8
+    req.mamba_next_track_idx = 0             # ring wrapped exactly once
+
+    free_before = pool.num_free_slots
+    cm.cache_req(req, finished=False)
+    assert pool.num_free_slots == free_before - 4     # one private clone per face
+    assert req.mamba_track_slots == ring              # the request keeps every face
+    assert req.mamba_track_seqlens == (None,) * 4     # all consumed
+
+    # every boundary is reachable, each from its own face's state
+    for boundary, face in ((2, 0), (4, 1), (6, 2), (8, 3)):
+        m = cm.match_req(_pend(ids[: boundary + 1] + [99]))
+        assert m.cuda_handle.cached_len == boundary, f"branch past {boundary} fell to {m.cuda_handle.cached_len}"
+        assert _slot_val(pool, m.mamba_value) == float(face + 1)
+        assert m.mamba_value not in ring               # a clone, never the request's own face
+        assert m.cuda_handle.get_matched_indices().tolist() == pages[:boundary]
+    cm.cache_req(req, finished=True)
+    cm.check_integrity()
+
+
+def test_ring_length_floors_at_two_so_the_overlap_always_has_a_frozen_face():
+    """One face would let a forward overwrite the snapshot the commit is about to donate."""
+    pt = torch.zeros(4, 64, dtype=torch.int32)
+    for asked in (0, 1, 2):
+        cm = CacheManager(64, 1, pt, "hybrid_radix", linear_state_pool=_pool(), track_slots=asked)
+        assert cm.track_slots == 2
+    assert CacheManager(64, 1, pt, "hybrid_radix", linear_state_pool=_pool(),
+                        track_slots=9).track_slots == 9
+
+
+def test_two_faces_on_one_boundary_cost_one_clone():
+    """The tool-call anchor freeze can land on a boundary a forward already tracked. insert()
+    dedups (mamba_exist -> the clone is freed), so this is about not paying for the second
+    clone at all: allocating it can trip ensure_mamba_slots -> evict_mamba, which is exactly
+    what the lock below the donation loop exists to guard against."""
+    pool = _pool(num_slots=32)
+    pt = torch.zeros(4, 64, dtype=torch.int32)
+    cm = CacheManager(64, 1, pt, "hybrid_radix", linear_state_pool=pool, track_slots=4)
+    ids = list(range(1, 11))
+    req, ring, pages = _admit_cold_ring(cm, pool, pt, ids, row=0, faces=4)
+    req.mamba_track_seqlens = (4, 4, 8, None)   # faces 0 and 1 both at boundary 4
+    req.mamba_last_track_seqlen = 8
+    req.mamba_next_track_idx = 3
+
+    free_before = pool.num_free_slots
+    cm.cache_req(req, finished=False)
+    assert pool.num_free_slots == free_before - 2   # boundaries {4, 8}, not faces {0, 1, 2}
+    m = cm.match_req(_pend(ids[:5] + [99]))
+    assert m.cuda_handle.cached_len == 4
+    assert _slot_val(pool, m.mamba_value) == 1.0    # face 0 won: first in ring order
+    assert m.cuda_handle.get_matched_indices().tolist() == pages[:4]
+    cm.cache_req(req, finished=True)
+    cm.check_integrity()
