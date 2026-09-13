@@ -292,11 +292,14 @@ def _linear_pool_num_slots(config) -> int:
     if config.cache_type != "hybrid_radix":
         return mr + 1  # live + dummy/padding
     ratio = config.linear_state_cache_ratio
-    # The cross-request cache has to be able to HOLD what the donate rings hand it: one request
-    # commits up to its whole ring at once, so a cache smaller than that evicts a prompt's own
-    # earlier boundaries before anyone can branch at them (measured: a ring of 8 donated 6
-    # boundaries into 4 slots, and a branch that should have resumed at 32,704 fell to 16,320).
-    n_cache = max(4, int(ratio * mr), _track_slots(config) * mr)
+    # The cross-request cache has to be able to HOLD one request's ring: a request commits up to
+    # its whole ring at once, so a cache smaller than that evicts a prompt's own earlier
+    # boundaries before anyone can branch at them (measured: a ring of 8 donated 6 boundaries
+    # into 4 slots, and a branch that should have resumed at 32,704 fell to 16,320). ONE ring,
+    # not one per running request: concurrent requests carry different prompts, so they evict
+    # each other by LRU the way any shared cache does -- that is the policy working, not the
+    # defect. Scaling by max_running_req cost 24 slots (1.44 GiB, ~870 expert slots) at mr=4.
+    n_cache = max(4, int(ratio * mr), _track_slots(config))
     return (2 + _track_slots(config)) * mr + n_cache + 1
 
 

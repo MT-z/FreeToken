@@ -328,6 +328,8 @@ def test_snapshot_cache_holds_a_whole_donate_ring():
 
     assert cache_slots(8) >= 8
     assert cache_slots(16) >= 16
-    assert cache_slots(4, mr=3) >= 4 * 3
+    # ONE ring's worth, not one per running request: concurrent requests hold different prompts,
+    # so they evict each other by LRU, which is the policy working rather than the defect.
+    assert cache_slots(4, mr=3) == max(4, int(2.0 * 3), 4)
     # the shipped 2-face default is unchanged: the ratio floor of 4 already covers it
     assert cache_slots(2) == 4
