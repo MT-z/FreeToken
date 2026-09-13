@@ -111,7 +111,13 @@ class Qwen3_5ForCausalLM(BaseLLMModel):
         super().__init__()
 
     def forward(self) -> torch.Tensor:
-        output = self.model.forward(get_global_ctx().batch.input_ids)
+        batch = get_global_ctx().batch
+        output = self.model.forward(batch.input_ids)
+        if batch.verify:
+            # The speculative cycle needs the pre-LM-head hidden of every checked position:
+            # the MTP head takes it as input, and a rejected cycle has to adopt the hidden of
+            # the position it actually keeps. forward_batch's ForwardOutput carries no hidden.
+            batch.verify_hidden = output
         return self.lm_head.forward(output)
 
 

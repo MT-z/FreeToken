@@ -126,7 +126,9 @@ class ParallelLMHead(VocabParallelEmbedding):
         ctx = get_global_ctx()
         batch = ctx.batch
         bs = batch.size
-        if batch.is_prefill:
+        # A verify needs logits at every checked position, so it keeps all rows; the normal
+        # prefill only samples each request's last one.
+        if batch.is_prefill and not batch.verify:
             indices = batch.attn_metadata.get_last_indices(bs)
             x = x[indices].contiguous()
             del indices

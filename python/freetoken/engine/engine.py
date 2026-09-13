@@ -362,6 +362,20 @@ def _materialize_loaded_weight_state_dict(
     return state_dict
 
 
+class VerifyResult(NamedTuple):
+    """One speculative verify's outputs. **Nothing here is committed.**
+
+    Rows are the batch's real positions in order (no padding), so row i answers for
+    ``positions[i]``: ``logits[i]`` predicts the token AFTER that position, and
+    ``hidden[i]`` is the target's post-norm, pre-LM-head hidden AT it. The caller decides
+    which rows to keep, and rolls the engine state back for the ones it drops.
+    """
+
+    logits: torch.Tensor      # [m, vocab_size], unprocessed (no sampler, no penalties)
+    hidden: torch.Tensor      # [m, hidden_size], post final norm / pre LM head
+    positions: torch.Tensor   # [m], the token positions these rows belong to
+
+
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
@@ -1122,6 +1136,57 @@ class Engine:
             chosen_logprobs_cpu=chosen_logprobs, top_ids_cpu=top_ids,
             top_logprobs_cpu=top_logprobs,
         )
+
+    def verify_forward(self, batch: Batch) -> VerifyResult:
+        """Run the target over a speculative batch and hand back EVERY checked position.
+
+        This is the speculative sibling of ``forward_batch``, and the difference is what it
+        does NOT do. ``forward_batch`` advances each request (``complete_one``), slices the
+        logits to one row per request, samples, and hands the scheduler something it will
+        publish -- all before anything has decided whether the drafted tokens are accepted.
+        A verify has to happen first, so none of that can run here:
+
+          * no ``complete_one`` and no other request-state advance
+          * no sampling, no logits processor, no RNG consumption
+          * no output, no prefix-cache publication, no token-pool update
+
+        It is NOT side-effect free. KV and the GDN state are updated in place for every
+        position in the batch, including a draft that may be rejected. **Snapshotting and
+        rollback are the caller's job**, as is excluding this request from any concurrent
+        forward, publication or release while the transaction is open.
+
+        Phase 1 keeps the shape small on purpose: one request, no padding, no CUDA graph
+        (``self.model.forward()`` directly, never ``graph_runner.replay``), text only.
+        """
+        assert torch.cuda.current_stream() == self.stream
+        assert batch.is_prefill, "verify runs in the extend shape; decode is 1 token/request"
+        assert batch.size == 1, "Phase 1 verifies a single request"
+        assert batch.padded_size == batch.size, "verify returns real rows only; do not pad"
+        assert not batch.mm_gather_plan, "Phase 1 verify is text-only"
+
+        batch.verify = True
+        batch.verify_hidden = None
+        try:
+            with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, False):
+                logits = self.model.forward()
+            if self.cpu_moe_executor is not None:
+                # Same handshake watchdog as forward_batch: a dead coordinator must surface
+                # as an error, not as silently stale expert outputs. Disabling overlap is
+                # not a reason to drop fault detection.
+                self.cpu_moe_executor.raise_if_unhealthy()
+            hidden = batch.verify_hidden
+            assert hidden is not None, (
+                "the model did not stash verify_hidden; this family has no verify support"
+            )
+            rows = batch.input_ids.numel()
+            assert logits.shape[0] == rows and hidden.shape[0] == rows, (
+                f"verify wants every position: {rows} in, "
+                f"logits {tuple(logits.shape)} hidden {tuple(hidden.shape)}"
+            )
+            return VerifyResult(logits=logits, hidden=hidden, positions=batch.positions)
+        finally:
+            batch.verify = False
+            batch.verify_hidden = None
 
     def _emit_moe_stats(self) -> None:
         """Report one window of expert-cache behaviour, then reset the miss counters.

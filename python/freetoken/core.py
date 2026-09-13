@@ -190,6 +190,12 @@ class Batch:
     # [3, n] t/h/w rope positions on mrope models; positions keeps its sequence-index meaning for token_pool / page_table
     mrope_positions: torch.Tensor | None = field(default=None, init=False)
     out_loc: torch.Tensor | None = field(init=False)
+    # Speculative verify: Engine.verify_forward sets this so the LM head keeps every row
+    # (a verify needs logits at all checked positions, not just each request's last) and the
+    # model stashes the pre-LM-head hidden into verify_hidden. It changes nothing else --
+    # the caller owns accept/reject, rollback, request advance and every kind of publication.
+    verify: bool = field(default=False, init=False)
+    verify_hidden: torch.Tensor | None = field(default=None, init=False)
     # Per-(padded-)request table_idx as a GPU int64 tensor, used by GatedDeltaNet
     # decode to gather/scatter recurrent+conv state without host-side loops (so the
     # decode step is CUDA-graph capturable). Set by the scheduler / graph buffer.
