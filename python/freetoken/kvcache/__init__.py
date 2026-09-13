@@ -224,7 +224,9 @@ def create_kvcache_pool(
             # Quantizes the KV tiers only -- the compressed index slab the score kernel
             # reads stays the engine dtype (kvcache/qsa_pool.py).
             kv_quant=kv_quant,
-            mrope=model_config.model_is_mrope,
+            # getattr: this branch's own pool tests drive the factory with namespace stubs that
+            # carry no mrope field (the same shape #300 flagged for the scheduler hooks).
+            mrope=getattr(model_config, "model_is_mrope", False),
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:

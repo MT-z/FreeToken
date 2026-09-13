@@ -152,7 +152,9 @@ def derive_model_card(config: Any, cache_pools: Any = None, last_rebuild: Any = 
         "ctx": effective_context_length(config, cache_pools, last_rebuild),
         "attn": attn,
         "moe": bool(getattr(mc, "is_moe", False)),
-        "input_modalities": ["text", *sorted(config.served_modalities)],
+        # getattr: derive_model_card is a metadata route -- it must never raise, and this
+        # branch's own tests call it with namespace stubs that predate served_modalities.
+        "input_modalities": ["text", *sorted(getattr(config, "served_modalities", ()))],
     }
 
 

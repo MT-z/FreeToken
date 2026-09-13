@@ -811,6 +811,7 @@ def _resolve_sampling(
         stop_token_ids=req.stop_token_ids,
         include_stop_str_in_output=req.include_stop_str_in_output,
         skip_special_tokens=req.skip_special_tokens,
+        default_max_tokens=default_max_tokens,
     )
     if isinstance(req, CompletionRequest) and req.logprobs is not None:
         sampling_params.logprobs = True
