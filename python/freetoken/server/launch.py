@@ -50,8 +50,6 @@ def _run_tokenize_worker(detach: bool, **kwargs) -> None:
     """Module-level so it survives the spawn pickle; exists only to detach the group first."""
     if detach:
         _detach_process_group()
-    # The gate is FREETOKEN_LOAD_VISION, read per process from the environment this worker
-    # inherits through the spawn -- nothing to thread in.
     from freetoken.tokenizer import tokenize_worker
 
     ack_queue = kwargs.get("ack_queue")

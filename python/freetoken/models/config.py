@@ -12,10 +12,9 @@ _VISION_TRUE = {"1", "true", "yes", "on"}
 
 
 def vision_load_enabled() -> bool:
-    """Vision is opt-in (default OFF). The vision tower is ~0.8 GiB of resident, never-quantized
-    (bf16) GPU weights that text-only serving never touches -- measured 0.832 GiB on
-    Ornith-1.5-35B-A3B-NVFP4, whose 333 visual tensors carry no quant scales at all. So it is
-    built and loaded only when ``FREETOKEN_LOAD_VISION=1`` is set."""
+    """Vision is opt-in (default OFF). The vision tower + multimodal embedder are ~1 GiB of
+    resident, never-quantized (bf16) GPU weights that text-only serving never touches, so we
+    skip building and loading them unless ``FREETOKEN_LOAD_VISION=1`` is set."""
     return os.getenv("FREETOKEN_LOAD_VISION", "0").strip().lower() in _VISION_TRUE
 
 

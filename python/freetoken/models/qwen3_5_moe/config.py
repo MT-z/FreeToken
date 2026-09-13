@@ -63,19 +63,6 @@ def parse_config(hf_config: Any) -> ModelConfig:
         else {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
     )
 
-    # Vision is opt-in (--vision / FREETOKEN_LOAD_VISION): the tower is ~0.8 GiB of resident
-    # bf16 that text-only serving never reads. Returning None here is the single switch --
-    # the model build and weight loading both flow through is_multimodal.
-    from freetoken.models.config import vision_load_enabled
-
-    from .vision import parse_vision_config
-
-    vision_cfg = (
-        parse_vision_config(getattr(hf_config, "vision_config", None), text.hidden_size)
-        if vision_load_enabled()
-        else None
-    )
-
     expert_quant, weight_block_size = _expert_quant(hf_config, text)
 
     # Dense variants (e.g. Qwen3.6-27B) report num_experts==0: route the decoder MLP through
@@ -140,7 +127,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         use_qk_norm=True,
         model_type=getattr(hf_config, "model_type", "qwen3_5_moe"),
         architectures=getattr(hf_config, "architectures", ["Qwen3_5MoeForConditionalGeneration"]),
-        vision_config=vision_cfg,
+        vision_config=None,  # text-only milestone
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,

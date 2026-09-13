@@ -32,7 +32,7 @@ from freetoken.models.config import KVCacheGroupSpec
 from freetoken.scheduler import cache as cache_mod
 from freetoken.scheduler.cache import CacheManager
 from freetoken.scheduler.decode import DecodeManager
-from freetoken.scheduler.prefill import ChunkedReq, PrefillAdder, PrefillManager
+from freetoken.scheduler.prefill import ChunkedReq, PrefillManager
 from freetoken.scheduler.table import TableManager
 from freetoken.scheduler.utils import PendingReq
 
@@ -223,6 +223,7 @@ def test_a_per_request_sized_pool_cannot_hold_a_full_batch(monkeypatch):
         _decode(cm, reqs, n_decode)
 
 
+# --------------------------------------------------------------- the floor formula
 def test_floor_terms_and_page_rounding():
     for window in (8, 128, 1024):
         for ps in (1, 8, 64, 128):
