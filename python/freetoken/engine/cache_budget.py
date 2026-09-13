@@ -28,14 +28,84 @@ def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
     return sum(t[0][0].numel() * t[0].element_size() for t in sources.values())
 
 
+# Mirrors CHUNK_SIZE in kernel/fla/chunk.py, which this module must not import (it is torch-
+# free by contract). test_scratch_model_tracks_the_kernel_chunk_size holds the two together.
+GDN_CHUNK_SIZE = 64
+
+
+# The gated-delta-rule chunk-prefill path (kernel/fla/chunk.py) holds these at once, for the
+# one layer it is currently on -- layers run sequentially, so this is the peak, not a sum:
+#
+#   h      [NT, H, V, K], one state per 64-token chunk .. num_v * V * K * dt // 64  <- dominant
+#   o, v_new, u   [T, H, V] ............................. 3 * num_v * V * dt
+#   w             [T, H, K] ............................. num_v * K * dt
+#   A             [T, H, 64] ............................ num_v * 64 * dt
+#   q, k, after the in-kernel l2norm .................... 2 * num_k * K * dt
+#   g, the fp32 cumsum .................................. num_v * 4
+#
+# Measured on Ornith-1.5-35B-A3B (16x128 key / 32x128 value, bf16) at T in {2048 .. 32768}:
+# 61,568 B/token, linear with a zero intercept. This expression reproduces that exactly.
+def gdn_prefill_scratch_per_token(
+    *,
+    num_key_heads: int,
+    key_head_dim: int,
+    num_value_heads: int,
+    value_head_dim: int,
+    dtype_bytes: int,
+) -> int:
+    """Bytes of chunk-prefill scratch one gated-delta-rule layer needs per token of a chunk."""
+    per_value = num_value_heads * value_head_dim * dtype_bytes
+    return (
+        num_value_heads * value_head_dim * key_head_dim * dtype_bytes // GDN_CHUNK_SIZE
+        + 3 * per_value
+        + num_value_heads * key_head_dim * dtype_bytes
+        + num_value_heads * GDN_CHUNK_SIZE * dtype_bytes
+        + 2 * num_key_heads * key_head_dim * dtype_bytes
+        + num_value_heads * 4
+    )
+
+
+# The (1-memory_ratio) headroom was calibrated while the shipped chunk was this size, so only
+# the GROWTH above it is charged below: a default configuration plans byte-for-byte as it did
+# before, and only the chunk sizes that used to die in the kernel pay anything. Charging the
+# full activation cost is a larger change -- it would shrink every existing expert cache.
+HEADROOM_BASELINE_EXTEND_TOKENS = 8192
+
+
+def prefill_scratch_reserve_bytes(config) -> int:
+    """GPU bytes to withhold from the cache budget because ``--max-prefill-length`` was raised
+    above the size the fixed ``(1-memory_ratio)`` headroom covers. 0 for non-GDN models and
+    for any chunk at or below the baseline."""
+    group = config.model_config.linear_attention_group()
+    if group is None:
+        return 0
+    # getattr, not attribute access: the budget tests drive this with stub configs that carry
+    # no scheduler fields (same reason as num_page_override in Engine._resolve_auto_moe_cache_size).
+    growth = int(getattr(config, "max_extend_tokens", 0) or 0) - HEADROOM_BASELINE_EXTEND_TOKENS
+    if growth <= 0:
+        return 0
+    return growth * gdn_prefill_scratch_per_token(
+        num_key_heads=group.num_key_heads,
+        key_head_dim=group.key_head_dim,
+        num_value_heads=group.num_value_heads,
+        value_head_dim=group.value_head_dim,
+        dtype_bytes=config.dtype.itemsize,
+    )
+
+
 def net_cache_budget_bytes(
-    memory_ratio: float, baseline_free: int, weights_bytes: int, fixed_cache_size: int
+    memory_ratio: float,
+    baseline_free: int,
+    weights_bytes: int,
+    fixed_cache_size: int,
+    prefill_scratch_bytes: int = 0,
 ) -> int:
     """Net GPU bytes available for the MoE + KV pools: ``memory_ratio`` of the pre-model
-    baseline minus weights and fixed (non-paged) cache. The ``(1-memory_ratio)`` remainder
-    is the CUDA-graph/activation headroom. Single source of truth for startup auto-sizing
-    and the runtime-rebuild fit check."""
-    return int(memory_ratio * baseline_free) - weights_bytes - fixed_cache_size
+    baseline minus weights, fixed (non-paged) cache, and any chunk-prefill scratch the
+    ``(1-memory_ratio)`` headroom does not cover. That remainder is the CUDA-graph/activation
+    headroom. Single source of truth for startup auto-sizing and the runtime-rebuild fit
+    check -- both subtract the scratch here, so a rebuild cannot grow back into it."""
+    return int(memory_ratio * baseline_free) - weights_bytes - fixed_cache_size - prefill_scratch_bytes
 
 
 def required_bytes(
@@ -89,7 +159,8 @@ def plan_cache_budget(
     assert total <= budget_bytes, (
         f"cache budget too small: minimum plan (moe={moe_cache_size} slots, "
         f"kv={num_pages} pages) needs {total} B > budget {budget_bytes} B "
-        "(raise memory_ratio, lower kv_reserve_tokens, or free GPU memory)"
+        "(raise memory_ratio, lower kv_reserve_tokens or max_extend_tokens, "
+        "or free GPU memory)"
     )
     assert num_pages > 1, "not enough memory for KV cache after MoE allocation"
     return moe_cache_size, num_pages, overlap
@@ -109,6 +180,7 @@ def resolve_moe_cache_auto(
     kv_reserve_tokens: int,
     page_size: int,
     max_slots: int | None = None,
+    prefill_scratch_bytes: int = 0,
 ) -> tuple[int, int, bool]:
     """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
@@ -116,9 +188,12 @@ def resolve_moe_cache_auto(
 
     Applies memory_ratio to the persisted pre-model baseline exactly once, then defers
     the MoE-vs-KV split to plan_cache_budget. The (1-memory_ratio) remainder is the
-    CUDA-graph/activation headroom (not subtracted here).
+    CUDA-graph/activation headroom; ``prefill_scratch_bytes`` is the part of the chunk-prefill
+    activation cost that headroom was never sized for (see prefill_scratch_reserve_bytes).
     """
-    budget_bytes = net_cache_budget_bytes(memory_ratio, baseline_free, weights_bytes, fixed_cache_size)
+    budget_bytes = net_cache_budget_bytes(
+        memory_ratio, baseline_free, weights_bytes, fixed_cache_size, prefill_scratch_bytes
+    )
     max_slots = total_experts if max_slots is None else min(max_slots, total_experts)
     # Every pool keeps page 0 as an unreachable dummy/sentinel. The CLI floor is expressed in
     # usable tokens, so reserve that internal page in addition to the user-visible capacity.

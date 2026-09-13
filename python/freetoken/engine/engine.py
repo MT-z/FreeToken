@@ -635,7 +635,11 @@ class Engine:
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
         without a GPU. Reused by the Phase-2 runtime rebuild.
         """
-        from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
+        from freetoken.engine.cache_budget import (
+            expert_bytes_per_slot,
+            prefill_scratch_reserve_bytes,
+            resolve_moe_cache_auto,
+        )
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
@@ -664,6 +668,10 @@ class Engine:
             kv_reserve_tokens=kv_reserve_tokens,
             page_size=page_tokens,
             max_slots=method.slot_limit() if method is not None else None,
+            # A chunk above the shipped default needs more GDN prefill scratch than the flat
+            # (1-memory_ratio) headroom holds; without this the planner hands those bytes to
+            # experts and the first long prefill dies in chunk_o with the backend unrecoverable.
+            prefill_scratch_bytes=prefill_scratch_reserve_bytes(config),
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:

@@ -141,7 +141,11 @@ class BaseKVCachePool(ABC):
         sizing target by declaring it on ITS kv_cost, with no base-signature churn."""
         import inspect
 
-        from freetoken.engine.cache_budget import net_cache_budget_bytes, required_bytes
+        from freetoken.engine.cache_budget import (
+            net_cache_budget_bytes,
+            prefill_scratch_reserve_bytes,
+            required_bytes,
+        )
 
         target_pages = num_pages if num_pages is not None else current_num_pages
         cost_params = inspect.signature(type(self).kv_cost).parameters
@@ -152,6 +156,7 @@ class BaseKVCachePool(ABC):
         budget = net_cache_budget_bytes(
             config.memory_ratio, baseline_free, weights_bytes,
             fixed_cache_size + extra_fixed_bytes,
+            prefill_scratch_reserve_bytes(config),
         )
         need = required_bytes(target_moe, target_pages, per_expert_bytes, cache_per_page)
         if need > budget:

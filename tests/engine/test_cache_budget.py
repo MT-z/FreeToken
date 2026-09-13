@@ -590,3 +590,122 @@ def test_uncapped_platform_stays_uncapped(monkeypatch):
     if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
         pytest.skip("WSL caps pinning")
     assert _pin_budget_bytes(reserved=2**30) is None
+
+
+
+# ---------------------------------------------------------------------------
+# Chunk-prefill scratch: the (1-memory_ratio) headroom is a flat fraction, but the GDN
+# chunk path's scratch scales with --max-prefill-length. Measured 2026-09-13: raising the
+# chunk 4,096 -> 32,768 left the plan at 7,144 / 7,054 / 7,044 / 7,053 slots -- unchanged --
+# and everything above 8,192 died in chunk_o.py with the backend worker unrecoverable.
+# ---------------------------------------------------------------------------
+
+# Enough budget that the expert fill lands strictly inside [lo, hi], so the reserve actually
+# moves the slot count instead of being absorbed by a clamp.
+_BUDGET = dict(
+    baseline_free=24_000_000_000, weights_bytes=12_000_000_000, memory_ratio=0.9,
+    cache_per_page=1_000, fixed_cache_size=0, per_expert_bytes=1_700_000,
+    num_experts=256, total_experts=10_240, prefill_overlap=True,
+    kv_reserve_tokens=0, page_size=1,
+)
+
+
+def _gdn_budget_config(max_extend_tokens, *, gdn=True):
+    """A config shaped like the ones the budget policy actually reads, with Ornith-1.5's
+    linear-attention geometry -- the geometry the per-token constant was measured on."""
+    from freetoken.models.config import LinearGatedDeltaGroupConfig
+
+    group = LinearGatedDeltaGroupConfig(
+        name="linear", layer_ids=tuple(range(30)),
+        num_key_heads=16, key_head_dim=128,
+        num_value_heads=32, value_head_dim=128,
+        conv_kernel_dim=4, output_gate="sigmoid",
+    )
+
+    class StubModelConfig:
+        def linear_attention_group(self):
+            return group if gdn else None
+
+    class StubConfig:
+        dtype = torch.bfloat16
+        model_config = StubModelConfig()
+
+    cfg = StubConfig()
+    if max_extend_tokens is not None:
+        cfg.max_extend_tokens = max_extend_tokens
+    return cfg
+
+
+def test_gdn_scratch_per_token_reproduces_the_measured_value():
+    # /var/tmp/gdn-scratch.py drove the real kernel at T in {2048 .. 32768} on the 4090 and
+    # read max_memory_allocated: 61,568 B/token at every T, linear, zero intercept.
+    from freetoken.engine.cache_budget import gdn_prefill_scratch_per_token
+
+    assert gdn_prefill_scratch_per_token(
+        num_key_heads=16, key_head_dim=128,
+        num_value_heads=32, value_head_dim=128, dtype_bytes=2,
+    ) == 61_568
+
+
+def test_raising_the_chunk_shrinks_the_expert_plan():
+    """The defect itself: a planner that cannot see max_extend_tokens gives both chunks the
+    same slot count, and the larger one then OOMs in the kernel."""
+    from freetoken.engine.cache_budget import prefill_scratch_reserve_bytes
+
+    def plan(chunk):
+        return resolve_moe_cache_auto(
+            **_BUDGET,
+            prefill_scratch_bytes=prefill_scratch_reserve_bytes(_gdn_budget_config(chunk)),
+        )[0]
+
+    default, doubled = plan(8_192), plan(16_384)
+    assert doubled < default, "the larger chunk must cost expert slots, not crash later"
+    # 8,192 extra chunk tokens x 61,568 B = 481 MiB withheld, at 1.7 MB per slot.
+    assert abs((default - doubled) - 8_192 * 61_568 // 1_700_000) <= 1
+
+
+def test_default_chunk_plans_exactly_as_before():
+    """No regression for anyone on the shipped default: the reserve is 0 at or below the
+    baseline, so the plan is identical to one computed without the argument at all."""
+    from freetoken.engine.cache_budget import prefill_scratch_reserve_bytes
+
+    for chunk in (4_096, 8_192):
+        assert prefill_scratch_reserve_bytes(_gdn_budget_config(chunk)) == 0
+        assert resolve_moe_cache_auto(**_BUDGET, prefill_scratch_bytes=0) == resolve_moe_cache_auto(
+            **_BUDGET
+        )
+
+
+def test_non_gdn_model_reserves_nothing_however_large_the_chunk():
+    from freetoken.engine.cache_budget import prefill_scratch_reserve_bytes
+
+    assert prefill_scratch_reserve_bytes(_gdn_budget_config(262_144, gdn=False)) == 0
+
+
+def test_headroom_baseline_tracks_the_shipped_chunk_default():
+    """Tripwire: the reserve is calibrated against the shipped default chunk, so if that
+    default moves, this constant has to move with it or the calibration drifts in silence."""
+    from freetoken.engine.cache_budget import HEADROOM_BASELINE_EXTEND_TOKENS
+    from freetoken.scheduler.config import SchedulerConfig
+
+    assert HEADROOM_BASELINE_EXTEND_TOKENS == SchedulerConfig.max_extend_tokens
+
+
+def test_rebuild_fit_check_withholds_the_same_scratch():
+    """A runtime rebuild must not hand the scratch back to the experts -- otherwise the
+    crash returns the moment the cache is resized."""
+    from freetoken.engine.cache_budget import net_cache_budget_bytes, prefill_scratch_reserve_bytes
+
+    reserve = prefill_scratch_reserve_bytes(_gdn_budget_config(16_384))
+    assert reserve == 8_192 * 61_568
+    plain = net_cache_budget_bytes(0.9, 24_000_000_000, 12_000_000_000, 0)
+    assert net_cache_budget_bytes(0.9, 24_000_000_000, 12_000_000_000, 0, reserve) == plain - reserve
+
+
+def test_scratch_model_tracks_the_kernel_chunk_size():
+    """The h term is per 64-token chunk. cache_budget must stay torch-free so it cannot import
+    the kernel's constant; this is the seam that keeps the copy honest."""
+    from freetoken.engine.cache_budget import GDN_CHUNK_SIZE
+    from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
+    assert GDN_CHUNK_SIZE == CHUNK_SIZE
