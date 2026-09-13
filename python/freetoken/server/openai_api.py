@@ -32,6 +32,7 @@ from .logprobs import (
     completions_logprobs,
 )
 from .generation import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
     ContentDelta,
     GenDone,
     GenerationError,
@@ -67,6 +68,7 @@ def _thinking_type(req: Any) -> str | None:
 def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
+    default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
     from .model_meta import effort_toggle_kwargs
@@ -77,7 +79,7 @@ def chat_request_to_genspec(
         ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
     if req.continue_final_message:
         ctk = {**ctk, "continue_final_message": True}
-    sampling_params = _resolve_sampling(req, model_sampling)
+    sampling_params = _resolve_sampling(req, model_sampling, default_max_tokens=default_max_tokens)
     # #224 の logprobs は #393 の _resolve_sampling の結果に載せる（#393 は min_p / penalties /
     # logit_bias / stop_token_ids も詰めるので、pr224 側の resolve_sampling 直呼びは使わない）
     sampling_params.logprobs = bool(req.logprobs)
@@ -228,7 +230,10 @@ async def handle_chat_completion(
             )
 
     try:
-        spec = chat_request_to_genspec(req, model_sampling)
+        default_max_tokens = (
+            getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
+        )
+        spec = chat_request_to_genspec(req, model_sampling, default_max_tokens=default_max_tokens)
     except ValueError as exc:
         return create_error_response(str(exc))
 
@@ -467,7 +472,10 @@ async def handle_completion(
     if not 1 <= req.n <= MAX_N:
         return create_error_response(f"n must be between 1 and {MAX_N}", param="n")
     try:  # surfaces an out-of-range value as a 400 rather than a 500 from the worker
-        sampling = _resolve_sampling(req, model_sampling)
+        default_max_tokens = (
+            getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
+        )
+        sampling = _resolve_sampling(req, model_sampling, default_max_tokens=default_max_tokens)
     except ValueError as exc:
         return create_error_response(str(exc))
 
@@ -784,6 +792,7 @@ def create_error_response(
 def _resolve_sampling(
     req: ChatCompletionRequest | CompletionRequest,
     model_sampling: dict[str, Any],
+    default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> SamplingParams:
     sampling_params = resolve_sampling(
         temperature=req.temperature,

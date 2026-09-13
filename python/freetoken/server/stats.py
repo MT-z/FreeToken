@@ -152,6 +152,7 @@ def derive_model_card(config: Any, cache_pools: Any = None, last_rebuild: Any = 
         "ctx": effective_context_length(config, cache_pools, last_rebuild),
         "attn": attn,
         "moe": bool(getattr(mc, "is_moe", False)),
+        "input_modalities": ["text", *sorted(config.served_modalities)],
     }
 
 

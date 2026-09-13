@@ -13,6 +13,7 @@ import torch
 from freetoken.distributed import get_tp_info
 from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
 from freetoken.layers.quantization import QuantConfig, QuantKind, QuantScheme, get_quant_config
+from freetoken.models.config import VISION_KEY_PREFIXES
 from freetoken.models.loader import ShardReader, iter_weight_files
 from freetoken.models.nvfp4_banks import Nvfp4ExpertSourceSpec
 from freetoken.models.register import ModelSpec, get_model_spec
@@ -20,6 +21,7 @@ from freetoken.utils import cached_load_hf_config
 from tqdm import tqdm
 
 from .config import parse_config
+from freetoken.models.qwen3_vl.weight import rename_vl_prefix
 
 # bf16 checkpoints store the routed experts pre-stacked per layer
 _STACKED_EXPERT_RE = re.compile(r"^model\.layers\.\d+\.mlp\.experts\.(gate_up_proj|down_proj)$")
@@ -47,22 +49,22 @@ _LINEAR_LEAVES = frozenset({
 })
 # activation scales of modules whose scheme carries no input_scale role
 _DROPPED_SUFFIXES = frozenset({"input_scale", "input_global_scale"})
+# Roles a W4A16 export legitimately does not store. The dequant-side activation scale exists
+# only in a W4A4 checkpoint and no W4A16 kernel reads it (quantization/linear/nvfp4.py), so a
+# scheme that declares it must not make an older NVFP4 export unloadable: default the identity.
+_OPTIONAL_ROLES = {"input_scale": 1.0}
 _ELEM_DTYPES = {"e4m3": torch.float8_e4m3fn, "e2m1": torch.uint8}
 _QUANT_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.uint8, torch.int8)
 
 
 def _rename(raw_name: str) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+    if raw_name.startswith("mtp."):
         return None
     # static KV-cache scales of the quantizers; the KV cache runs in the engine's dtype
     if raw_name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
         return None
-    if raw_name.startswith("model.language_model."):
-        return "model." + raw_name[len("model.language_model."):]
-    if raw_name.startswith("language_model."):
-        return "model." + raw_name[len("language_model."):]
-    return raw_name
+    return rename_vl_prefix(raw_name)
 
 
 def _is_gemma_norm(name: str) -> bool:
@@ -121,6 +123,8 @@ class _DenseReader:
                 self.by_part.setdefault(part, []).append((fused, idx))
         # target module -> (part count, {part: {role: tensor}}, {part: the roles its module stores})
         self.pending: dict[str, tuple[int, dict[int, dict[str, torch.Tensor]], dict[int, set[str]]]] = {}
+        # the scheme each pending target was stored under, for finalize()
+        self._stored: dict[str, QuantScheme | None] = {}
 
     def scheme(self, module: str) -> QuantScheme | None:
         return None if self.quant is None else self.quant.scheme_for(module)
@@ -163,12 +167,40 @@ class _DenseReader:
             raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} unquantized")
         target, idx, count = self.target(module)
         _, parts, expected = self.pending.setdefault(target, (count, {}, {}))
+        self._stored[target] = stored
         parts.setdefault(idx, {})[role] = tensor
         expected[idx] = set(roles.values())
         if len(parts) < count or any(set(parts[i]) != expected[i] for i in parts):
             return []
         del self.pending[target]
+        self._stored.pop(target, None)
         return self._emit(target, [parts[i] for i in range(count)], stored)
+
+    def finalize(self) -> Iterator[tuple[str, torch.Tensor]]:
+        """Emit the targets the checkpoint completed except for optional roles, then report the rest.
+
+        A scheme declares every role its kind can carry; a given export stores a subset. Waiting
+        for a role the checkpoint never had turns a loadable checkpoint into a missing-tensor
+        error -- which is what Ornith-1.5-35B-A3B-NVFP4 hit: its shared_expert projections and
+        lm_head store weight / weight_scale / weight_scale_2 and no input_scale.
+        """
+        for target in sorted(self.pending):
+            count, parts, expected = self.pending[target]
+            if len(parts) < count:
+                continue
+            missing = {i: expected[i] - set(parts[i]) for i in parts}
+            if any(m - set(_OPTIONAL_ROLES) for m in missing.values()):
+                continue
+            if not any(missing.values()):
+                continue  # complete but unemitted: a bug here, not an optional role
+            for i, roles in missing.items():
+                ref = next(iter(parts[i].values()))
+                for role in roles:
+                    parts[i][role] = torch.tensor(
+                        _OPTIONAL_ROLES[role], dtype=torch.float32, device=ref.device
+                    )
+            del self.pending[target]
+            yield from self._emit(target, [parts[i] for i in range(count)], self._stored.pop(target, None))
 
     def _emit(self, target: str, parts: list[dict[str, torch.Tensor]], stored: QuantScheme | None):
         if stored is not None:
@@ -225,6 +257,7 @@ def iter_weights(
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield the dense weights fused to the model's buffers, and the routed experts only where a resident path takes them from here: bf16 stacked experts as stored, block-fp8 experts restacked per layer.
 
@@ -237,17 +270,19 @@ def iter_weights(
     stacked = include_moe_experts and config.is_moe and config.expert_quant == "none"
     if include_non_moe or stacked:
         reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0])) if include_non_moe else None
-        yield from _iter_shards(model_path, device, reader, stacked=stacked)
+        yield from _iter_shards(model_path, device, reader, stacked=stacked, include_vision=include_vision)
     if include_moe_experts and config.is_moe and config.expert_quant == "fp8_block":
         yield from _resident_fp8_experts(model_path, config)
 
 
-def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | None, *, stacked: bool):
+def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | None, *, stacked: bool, include_vision: bool):
     for file in tqdm(iter_weight_files(model_path), desc="Loading weights", disable=not get_tp_info().is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
                 name = _rename(raw_name)
                 if name is None or _EXPERT_RE.search(name):
+                    continue
+                if not include_vision and name.startswith(VISION_KEY_PREFIXES):
                     continue
                 if _STACKED_EXPERT_RE.match(name):
                     if stacked:
@@ -263,8 +298,10 @@ def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | N
                     yield name, tensor + 1.0  # (1 + weight) baked into the stored norm weight
                 else:
                     yield name, tensor
-    if reader is not None and reader.pending:
-        raise ValueError(f"checkpoint is missing tensors of {sorted(reader.pending)}")
+    if reader is not None:
+        yield from reader.finalize()
+        if reader.pending:
+            raise ValueError(f"checkpoint is missing tensors of {sorted(reader.pending)}")
 
 
 def iter_weights_parallel(

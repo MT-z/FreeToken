@@ -7,11 +7,13 @@ import torch
 from freetoken.core import Batch, Req
 from freetoken.utils import align_down, div_ceil, init_logger
 
+from .mm import mm_rows_after
 from .utils import PendingReq
 
 if TYPE_CHECKING:
     from freetoken.kvcache import BaseCacheHandle
     from freetoken.message import UserMsg
+    from freetoken.mm.encoder_cache import EncoderCache
 
     from .cache import CacheManager
     from .decode import DecodeManager
@@ -43,6 +45,7 @@ class PrefillAdder:
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
+    encoder_cache: EncoderCache | None = None
     # SWA-pool tokens charged to reqs admitted so far this pass. Mirrors reserved_size: swa is
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
@@ -212,8 +215,10 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
-            mm_embeds=pending_req.mm_embeds,
         )
+        req.mm_items = pending_req.mm_items
+        req.mrope_positions_full = pending_req.mrope_positions_full
+        req.mrope_delta = pending_req.mrope_delta
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
         req.linear_slot_idx = linear_slot_idx
@@ -282,13 +287,11 @@ class PrefillManager:
     cache_manager: CacheManager
     table_manager: TableManager
     decode_manager: DecodeManager
+    encoder_cache: EncoderCache | None = None
     pending_list: List[PendingReq] = field(default_factory=list)
     # Terminal (uid, reason) pairs produced by the last scheduling pass; the scheduler
     # drains them into error replies.
     rejections: List[Tuple[int, str]] = field(default_factory=list)
-    #: The model's image token id, so a chunked multimodal prompt can be split anywhere the
-    #: image tokens are not. None on a text-only build, which restores the all-or-nothing rule.
-    image_token_id: int | None = None
 
     def drain_rejections(self) -> List[Tuple[int, str]]:
         out, self.rejections = self.rejections, []
@@ -300,8 +303,9 @@ class PrefillManager:
                 req.uid,
                 req.input_ids,
                 req.sampling_params,
-                mm_embeds=req.mm_embeds,
-                image_token_id=self.image_token_id,
+                mm_items=req.mm_items,
+                mrope_positions_full=req.mrope_positions,
+                mrope_delta=req.mrope_delta,
             )
         )
 
@@ -315,6 +319,7 @@ class PrefillManager:
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            encoder_cache=self.encoder_cache,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
@@ -339,6 +344,12 @@ class PrefillManager:
                     prompt_admissions.append(
                         (req.uid, pending_req.input_len, req.cache_handle.cached_len)
                     )
+                    if pending_req.mm_items and self.encoder_cache is not None:
+                        # claim the rows every chunk of this request will gather; the entry outlives the chunks
+                        for item in pending_req.mm_items:
+                            self.encoder_cache.register(
+                                item.hash, req.uid, mm_rows_after(item, req.cache_handle.cached_len)
+                            )
                 log_new_tokens += req.extend_len
                 if not is_continuation:
                     log_cached_tokens += req.cache_handle.cached_len
