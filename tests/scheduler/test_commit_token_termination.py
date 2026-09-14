@@ -489,3 +489,133 @@ def test_a_normal_request_is_unaffected_by_the_guard():
     stub._retire_req(req, set())
     got = _donation_at(cm, pool, req.input_ids[: req.cached_len])
     assert got == (req.cached_len, req.cached_len), got
+
+
+# --------------------------------- the same candidates must publish the same stream everywhere
+
+def _stream(msgs):
+    return [(m.next_token, m.finished, m.finish_reason, m.matched_stop) for m in msgs]
+
+
+def _launch(cm, req):
+    """Schedule + run one forward for this request, if it may still decode."""
+    if req.can_decode:
+        cm.allocate_paged([req])
+        req.complete_one()
+
+
+def _primed(cm, tm, dm, stub, **sp):
+    """One ordinary decode commit in, which is the state every driver starts from:
+    cached_len == len(input_ids) - 1, device_len == len(input_ids). The speculative commit
+    pays the ``complete_one`` for the forward that produced each token it keeps, so it has
+    to begin where a commit just ended -- the same place the normal drain does."""
+    req = _req(cm, tm, **sp)
+    dm.filter_reqs([req])
+    _step(cm, stub, req, ord("0"))
+    assert req.cached_len == req.input_ids.numel() - 1 == req.device_len - 1
+    return req
+
+
+def _drive_normal(cm, stub, req, tokens, *, overlap):
+    """The scheduler's own two loop shapes.
+
+    ``normal_loop`` launches a batch and drains it in the same iteration; ``overlap_loop``
+    launches the NEXT batch first and drains the previous one after -- which is exactly one
+    extra forward, standing ahead of every commit. That offset is what the termination rules
+    must not depend on.
+    """
+    reply, done = [], set()
+    if overlap:
+        _launch(cm, req)                                 # the next batch is always one ahead
+    for tok in tokens:
+        _launch(cm, req)                                 # this token's own forward
+        with cm.lazy_free_region():
+            fin = stub._commit_token(req, torch.tensor(tok, dtype=torch.int32),
+                                     reply=reply, new_finished_reqs=done, publish_prefix=False)
+        if fin:
+            break
+    return reply
+
+
+def _drive_spec(cm, stub, sent, req, tokens, chunks):
+    """gamma=1 cycles: each verifies ``n`` positions and commits what the rule accepted."""
+    pos = 0
+    for n in chunks:
+        chunk = tokens[pos:pos + n]
+        if not chunk:
+            break
+        back = req.device_len                            # the verify's extend window
+        req.device_len = req.cached_len + len(chunk)
+        cm.allocate_paged([req])
+        req.device_len = back
+        req.linear_state_len = req.cached_len + len(chunk)
+        pos += stub._commit_speculative(
+            req, torch.tensor(chunk, dtype=torch.int32),
+            batch=Batch(reqs=[req], phase="decode"))
+        if req.table_idx == -1:                          # terminated inside the commit
+            break
+    return sent
+
+
+# ``output_len`` counts the priming token too: _primed() already published one, so a budget
+# of k leaves k-1 for the scenario. The two "on the last slot" cases exist to make EOS/stop
+# and length fire on the SAME token, so the tail is sized for that -- without the +1 they
+# ended on length one token early and tested nothing (checked by printing the streams).
+SCENARIOS = [
+    ("budget runs out", [ord("a"), ord("b"), ord("c"), ord("d")], dict(output_len=3), "length"),
+    ("EOS in the middle", [ord("a"), EOS, ord("c"), ord("d")], dict(output_len=5), "stop"),
+    ("EOS on the last slot", [ord("a"), ord("b"), EOS, ord("d")], dict(output_len=4), "stop"),
+    ("stop string mid-stream", [ord("E"), ord("N"), ord("D"), ord("x")],
+     dict(output_len=5, stop_strs=["END"]), "stop"),
+    ("stop string on the last slot", [ord("E"), ord("N"), ord("D"), ord("x")],
+     dict(output_len=4, stop_strs=["END"]), "stop"),
+    ("stop token id", [ord("a"), ord("q"), ord("c")],
+     dict(output_len=5, stop_token_ids=[ord("q")]), "stop"),
+]
+CHUNKINGS = [(1, 1, 1, 1), (2, 2), (2, 1, 1), (1, 2, 1)]
+
+
+def test_the_three_commit_paths_publish_the_same_stream():
+    """normal / overlap / speculative, same candidate tokens, same sampling params.
+
+    The published token list AND the finish reason must agree. This is the property the
+    shared ``_commit_token`` was supposed to buy and did not: while the budget was read off
+    ``device_len``, overlap published one token fewer than the other two.
+    """
+    for name, toks, sp, want in SCENARIOS:
+        runs = {}
+        for mode in ("normal", "overlap"):
+            _pool, cm, tm, dm, stub, _sent, _pub = _setup()
+            req = _primed(cm, tm, dm, stub, **sp)
+            runs[mode] = _stream(_drive_normal(cm, stub, req, toks, overlap=(mode == "overlap")))
+        for chunks in CHUNKINGS:
+            _pool, cm, tm, dm, stub, sent, _pub = _setup()
+            req = _primed(cm, tm, dm, stub, **sp)
+            sent.clear()                                  # drop the priming token's reply
+            runs[f"spec{chunks}"] = _stream(_drive_spec(cm, stub, sent, req, toks, chunks))
+        first = runs["normal"]
+        assert first, f"{name}: nothing published"
+        assert first[-1][2] == want, (
+            f"{name}: この筋書きは {want} で終わるはずが {first[-1][2]} —— 条件に届いていない")
+        for mode, got in runs.items():
+            assert got == first, f"{name}: {mode} published {got}, normal published {first}"
+
+
+def test_exactly_one_terminal_reply_per_request():
+    """A request ends once. Nothing is published after the token that finished it, and the
+    finished flag is on that token and no other."""
+    for name, toks, sp, want in SCENARIOS:
+        for mode in ("normal", "overlap"):
+            _pool, cm, tm, dm, stub, _sent, _pub = _setup()
+            req = _primed(cm, tm, dm, stub, **sp)
+            got = _stream(_drive_normal(cm, stub, req, toks, overlap=(mode == "overlap")))
+            fin = [i for i, m in enumerate(got) if m[1]]
+            assert fin == [len(got) - 1], f"{name}/{mode}: finished flags at {fin} of {len(got)}"
+            assert got[-1][2] == want, f"{name}/{mode}: reason {got[-1][2]} != {want}"
+        for chunks in CHUNKINGS:
+            _pool, cm, tm, dm, stub, sent, _pub = _setup()
+            req = _primed(cm, tm, dm, stub, **sp)
+            sent.clear()
+            got = _stream(_drive_spec(cm, stub, sent, req, toks, chunks))
+            fin = [i for i, m in enumerate(got) if m[1]]
+            assert fin == [len(got) - 1], f"{name}/spec{chunks}: finished flags at {fin}"
