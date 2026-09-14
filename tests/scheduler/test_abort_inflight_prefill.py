@@ -71,8 +71,16 @@ def _setup():
         _pending_abort_acks=set(),
         _last_data=None,
     )
-    stub._free_req_resources = lambda req: Scheduler._free_req_resources(stub, req)
+    # Bind the unbound methods the drain calls on itself. Explicit, like the repo's other
+    # stub tests: a method the stub does not name is a method this test does not exercise.
+    for name in ("_free_req_resources", "_retire_req", "_commit_token", "_publish_replies"):
+        setattr(stub, name, _bind(stub, name))
     return pool, cm, tm, dm, pm, sent, stub
+
+
+def _bind(stub, name):
+    fn = getattr(Scheduler, name)
+    return lambda *a, **kw: fn(stub, *a, **kw)
 
 
 def _launch_req(pool, cm, tm, prompt, *, cls=Req, track_seqlen=None):

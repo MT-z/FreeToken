@@ -335,9 +335,7 @@ class Scheduler(SchedulerIOMixin):
                     # Aborted while this final-chunk prefill / decode step was in flight: free
                     # here (the forward is drained) and finish the request. No DetokenizeMsg --
                     # the abort ack flushed after this method stays the uid's terminal reply.
-                    self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
-                    new_finished_reqs.add(req)
+                    self._retire_req(req, new_finished_reqs)
                     continue
                 if req in self.finished_reqs:
                     # Overlap scheduling launched one more decode step for a request that
@@ -346,10 +344,6 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-
                 row_chosen_logprob: float | None = None
                 row_top_ids: list[int] | None = None
                 row_top_logprobs: list[float] | None = None
@@ -362,62 +356,21 @@ class Scheduler(SchedulerIOMixin):
                     else:
                         row_top_ids = []
                         row_top_logprobs = []
-                # EOS / stop-string -> "stop", output budget exhausted -> "length";
-                # EOS and stop strings win over length.
-                hit_length = not req.can_decode
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                ) or next_token in req.sampling_params.stop_token_ids
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
+                self._commit_token(
+                    req,
+                    next_tokens_cpu[i],
+                    reply=reply,
+                    new_finished_reqs=new_finished_reqs,
+                    # for prefill, non-chunk req, cache the prefix (a decode step does not).
+                    publish_prefix=batch.is_prefill,
+                    logprob_row=(row_chosen_logprob, row_top_ids, row_top_logprobs),
                 )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=req.uid,
-                        next_token=next_token,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                        matched_stop=matched_stop,
-                        stop_strs=req.sampling_params.stop_strs or None,
-                        keep_stop_str=req.sampling_params.include_stop_str_in_output,
-                        skip_special_tokens=req.sampling_params.skip_special_tokens,
-                        chosen_logprob=row_chosen_logprob,
-                        top_ids=row_top_ids,
-                        top_logprobs=row_top_logprobs,
-                    )
-                )
-
-                # NOTE: overlap scheduling may make the request freed twice, skip second free
-                if finished and req not in self.finished_reqs:
-                    self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
-                    new_finished_reqs.add(req)
-                elif batch.is_prefill and req.table_idx != -1:
-                    # for prefill, non-chunk req, cache the prefix.
-                    # Polymorphic: the DSV4 naive manager keeps the request's slots (no-op);
-                    # the generic manager inserts the prefix into its radix/naive cache.
-                    # table_idx == -1 is defense-in-depth: aborts mark in-flight requests
-                    # instead of freeing them (handled above), so a freed request should
-                    # never reach this commit -- but if a future path frees one early, skip
-                    # rather than re-read the freed page-table row (and on hybrid, deref the
-                    # None'd GDN ping-pong slots).
-                    self.cache_manager.cache_req(req, finished=False)
 
         self.finished_reqs = new_finished_reqs
+        self._publish_replies(batch, reply)
+
+    def _publish_replies(self, batch: Batch, reply: List[DetokenizeMsg]) -> None:
+        """Stamp the drain's replies with live pool occupancy, report the batch, send."""
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
         # status bar) can show live KV usage without a separate query.
         used, total = self._kv_usage_pages()
@@ -446,6 +399,181 @@ class Scheduler(SchedulerIOMixin):
             swa_tokens=swa_tokens,
         )
         self.send_result(reply)
+
+    def _retire_req(self, req: Req, new_finished_reqs: Set[Req]) -> None:
+        """Take a request out of decode and release everything it holds.
+
+        These three lines were already identical at the two drain sites (aborted under an
+        in-flight forward, and terminated on this token); a speculative cycle is a third
+        caller. Only ``_free_req_resources`` is idempotent (the ``table_idx == -1``
+        sentinel), so the "already finished" guard stays with the callers that need it.
+        """
+        self.decode_manager.remove_req(req)
+        self._free_req_resources(req)
+        new_finished_reqs.add(req)
+
+    def _commit_token(
+        self,
+        req: Req,
+        next_token: torch.Tensor,
+        *,
+        reply: List[DetokenizeMsg],
+        new_finished_reqs: Set[Req],
+        publish_prefix: bool,
+        logprob_row: Tuple[float | None, list[int] | None, list[float] | None] = (None, None, None),
+    ) -> bool:
+        """Append ONE sampled token to a request's history and decide whether it ended there.
+
+        Returns True if the request finished on this token. This is the only place the
+        per-token termination rules live, which is the point: a speculative cycle emits up
+        to gamma+1 tokens from a single forward and feeds them through here one at a time,
+        in token order (``_commit_speculative``), rather than carrying its own copy of the
+        rules. All three decisions are per-token and order-dependent:
+
+          * ``_match_stop_str`` decodes the tail of ``req.input_ids`` -- it can only see a
+            token that has already been appended
+          * ``hit_length`` reads ``remain_len``, which moves one position per token
+          * ``toolcall_anchor_len`` is the history length AT this token, and is recorded
+            only when the request did not finish on it
+
+        Entry contract -- the position bookkeeping this token's forward has already done.
+        ``forward_batch`` calls ``complete_one`` once per request; ``verify_forward``
+        deliberately does not, so its caller makes the same call per committed token:
+
+            cached_len == len(input_ids)     this token's position has been computed
+            device_len == cached_len + 1     and the next token's KV lands one past it
+
+        Holding that is what keeps publication honest without a second code path:
+        ``cache_req`` publishes ``input_ids[:cached_len]``, so a position a verify computed
+        but committed no token to is never inserted into the prefix cache.
+        """
+        assert next_token.dim() == 0, f"one token at a time, got shape {tuple(next_token.shape)}"
+        assert req.cached_len == req.input_ids.numel(), (
+            f"commit runs one token behind the computed frontier: "
+            f"cached_len={req.cached_len} history={req.input_ids.numel()}"
+        )
+        assert req.device_len == req.cached_len + 1, (
+            f"device_len={req.device_len} should be one past cached_len={req.cached_len}"
+        )
+        req.append_host(next_token.unsqueeze(0))
+        tok = int(next_token.item())
+        row_chosen_logprob, row_top_ids, row_top_logprobs = logprob_row
+        # EOS / stop-string -> "stop", output budget exhausted -> "length";
+        # EOS and stop strings win over length.
+        hit_length = not req.can_decode
+        hit_eos = (
+            not req.sampling_params.ignore_eos and tok in self.eos_token_ids
+        ) or tok in req.sampling_params.stop_token_ids
+        matched_stop = (
+            self._match_stop_str(req)
+            if not hit_eos and req.sampling_params.stop_strs
+            else None
+        )
+        finished = hit_length or hit_eos or matched_stop is not None
+        finish_reason = (
+            ("stop" if (hit_eos or matched_stop is not None) else "length")
+            if finished
+            else None
+        )
+        if (
+            tok == self.toolcall_anchor_id
+            and req.toolcall_anchor_len is None
+            and not finished
+        ):
+            req.toolcall_anchor_len = req.input_ids.numel()
+        reply.append(
+            DetokenizeMsg(
+                uid=req.uid,
+                next_token=tok,
+                finished=finished,
+                finish_reason=finish_reason,
+                matched_stop=matched_stop,
+                stop_strs=req.sampling_params.stop_strs or None,
+                keep_stop_str=req.sampling_params.include_stop_str_in_output,
+                skip_special_tokens=req.sampling_params.skip_special_tokens,
+                chosen_logprob=row_chosen_logprob,
+                top_ids=row_top_ids,
+                top_logprobs=row_top_logprobs,
+            )
+        )
+
+        # NOTE: overlap scheduling may make the request freed twice, skip second free
+        if finished and req not in self.finished_reqs:
+            self._retire_req(req, new_finished_reqs)
+        elif publish_prefix and req.table_idx != -1:
+            # Polymorphic: the DSV4 naive manager keeps the request's slots (no-op);
+            # the generic manager inserts the prefix into its radix/naive cache.
+            # table_idx == -1 is defense-in-depth: aborts mark in-flight requests
+            # instead of freeing them (handled by the caller), so a freed request should
+            # never reach this commit -- but if a future path frees one early, skip
+            # rather than re-read the freed page-table row (and on hybrid, deref the
+            # None'd GDN ping-pong slots).
+            self.cache_manager.cache_req(req, finished=False)
+        return finished
+
+    def _commit_speculative(self, req: Req, tokens: torch.Tensor, *, batch: Batch) -> int:
+        """Publish a gamma=1 verify cycle's committed tokens through the normal commit path.
+
+        ``tokens`` is what the accept/reject rule decided, in output order: one token when
+        the draft was rejected (the corrected token), two when it was accepted (the draft,
+        then the bonus). Returns how many were actually published.
+
+        Everything this adds on top of ``_commit_token`` is ordering:
+
+          * ``complete_one`` per committed token. ``verify_forward`` does not advance the
+            request -- that is why it exists -- so the advance happens here, once per token
+            that is kept. A rejected draft's position is never advanced over, which is what
+            leaves its KV (computed from the draft) outside ``[0, cached_len)`` for the
+            next forward to overwrite; the GDN state, being positionless, is the caller's
+            to restore.
+          * stop at the first token that finishes. A bonus following a token that hit EOS,
+            a stop string, or the output budget is not withdrawn after the fact -- it is
+            never appended, never replied, and never inside the committed KV range.
+
+        No stop rule is restated here. Remaining budget 0/1/2 falls out of ``hit_length``
+        moving with ``complete_one``: with one slot left, the draft's own commit reports
+        "length" and the bonus never runs.
+        """
+        assert req not in self.finished_reqs, (
+            "a finished request must not enter a verify cycle; Phase 1 runs without overlap "
+            "scheduling, so there is no in-flight step that could have terminated it"
+        )
+        assert not req.sampling_params.logprobs, (
+            "Phase 1 verify produces no logprobs: the accepted draft's probability comes "
+            "from the verify logits and the bonus's from the row after it, which is a "
+            "different row layout than the sampler's. Refuse rather than reply with none"
+        )
+        n = tokens.numel()
+        assert 1 <= n <= 2, f"gamma=1 commits 1 or 2 tokens, got {n}"
+        reply: List[DetokenizeMsg] = []
+        new_finished_reqs: Set[Req] = set()
+        published = 0
+        with self.cache_manager.lazy_free_region():
+            if req.aborted:
+                # Aborted while the verify was in flight. Same rule as a normal drain: no
+                # token, no prefix, just the release now that the forward is drained. The
+                # transaction's own snapshot slot and staging KV are the caller's to
+                # release, after it has confirmed the GPU is done with them.
+                self._retire_req(req, new_finished_reqs)
+            else:
+                for k in range(n):
+                    req.complete_one()
+                    finished = self._commit_token(
+                        req,
+                        tokens[k],
+                        reply=reply,
+                        new_finished_reqs=new_finished_reqs,
+                        # A verify batch is in the extend shape, but it continues decode --
+                        # and a decode step publishes no prefix. The committed prefix
+                        # reaches the cache the same way a normal request's does, at finish.
+                        publish_prefix=False,
+                    )
+                    published += 1
+                    if finished:
+                        break
+        self.finished_reqs = new_finished_reqs
+        self._publish_replies(batch, reply)
+        return published
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
