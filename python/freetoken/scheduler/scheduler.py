@@ -436,25 +436,16 @@ class Scheduler(SchedulerIOMixin):
           * ``toolcall_anchor_len`` is the history length AT this token, and is recorded
             only when the request did not finish on it
 
-        Entry contract -- the position bookkeeping this token's forward has already done.
-        ``forward_batch`` calls ``complete_one`` once per request; ``verify_forward``
-        deliberately does not, so its caller makes the same call per committed token:
-
-            cached_len == len(input_ids)     this token's position has been computed
-            device_len == cached_len + 1     and the next token's KV lands one past it
-
-        Holding that is what keeps publication honest without a second code path:
-        ``cache_req`` publishes ``input_ids[:cached_len]``, so a position a verify computed
-        but committed no token to is never inserted into the prefix cache.
+        No position contract is asserted here, and the reason is overlap scheduling:
+        ``overlap_loop`` LAUNCHES the next batch before draining this one, so by the time a
+        token is committed its request may already have been advanced again by the next
+        forward's ``complete_one`` -- ``cached_len`` is then one AHEAD of the history. The
+        strict "one behind the frontier" relation holds only where no later forward has been
+        launched, which is the speculative caller's situation; ``_commit_speculative``
+        asserts it there. (Found by running a real overlapped generation: the assert lived
+        here first and fired on a chunked prefill's commit.)
         """
         assert next_token.dim() == 0, f"one token at a time, got shape {tuple(next_token.shape)}"
-        assert req.cached_len == req.input_ids.numel(), (
-            f"commit runs one token behind the computed frontier: "
-            f"cached_len={req.cached_len} history={req.input_ids.numel()}"
-        )
-        assert req.device_len == req.cached_len + 1, (
-            f"device_len={req.device_len} should be one past cached_len={req.cached_len}"
-        )
         req.append_host(next_token.unsqueeze(0))
         tok = int(next_token.item())
         row_chosen_logprob, row_top_ids, row_top_logprobs = logprob_row
@@ -520,12 +511,23 @@ class Scheduler(SchedulerIOMixin):
 
         Everything this adds on top of ``_commit_token`` is ordering:
 
-          * ``complete_one`` per committed token. ``verify_forward`` does not advance the
-            request -- that is why it exists -- so the advance happens here, once per token
-            that is kept. A rejected draft's position is never advanced over, which is what
-            leaves its KV (computed from the draft) outside ``[0, cached_len)`` for the
-            next forward to overwrite; the GDN state, being positionless, is the caller's
-            to restore.
+          * ``complete_one`` per committed token, and the position contract that goes with
+            it. ``verify_forward`` does not advance the request -- that is why it exists --
+            so the advance happens here, once per token that is kept:
+
+                cached_len == len(input_ids)     this token's position has been computed
+                device_len == cached_len + 1     and the next token's KV lands one past it
+
+            Holding that is what keeps publication honest without a second code path:
+            ``cache_req`` publishes ``input_ids[:cached_len]``, so a position a verify
+            computed but committed no token to is never inserted into the prefix cache.
+            It is asserted HERE and not in ``_commit_token`` because the normal drain runs
+            under overlap scheduling, where the next batch's ``complete_one`` has already
+            moved ``cached_len`` one past the history. Phase 1 launches no overlapping
+            forward, so the relation is exact for a verify cycle.
+            A rejected draft's position is never advanced over, which is what leaves its KV
+            (computed from the draft) outside ``[0, cached_len)`` for the next forward to
+            overwrite; the GDN state, being positionless, is the caller's to restore.
           * stop at the first token that finishes. A bonus following a token that hit EOS,
             a stop string, or the output budget is not withdrawn after the fact -- it is
             never appended, never replied, and never inside the committed KV range.
@@ -558,6 +560,14 @@ class Scheduler(SchedulerIOMixin):
             else:
                 for k in range(n):
                     req.complete_one()
+                    assert req.cached_len == req.input_ids.numel(), (
+                        f"verify の確定は計算済み frontier の 1 つ後ろで動く: "
+                        f"cached_len={req.cached_len} history={req.input_ids.numel()}"
+                    )
+                    assert req.device_len == req.cached_len + 1, (
+                        f"device_len={req.device_len} should be one past "
+                        f"cached_len={req.cached_len}"
+                    )
                     finished = self._commit_token(
                         req,
                         tokens[k],

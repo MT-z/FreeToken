@@ -103,6 +103,14 @@ def _step(cm, stub, req, token, *, publish_prefix=False, reply=None, done=None):
         )
 
 
+def _step_raw(cm, stub, req, token):
+    """Commit one token with the request left exactly as the caller set it up."""
+    with cm.lazy_free_region():
+        return stub._commit_token(
+            req, torch.tensor(token, dtype=torch.int32),
+            reply=[], new_finished_reqs=set(), publish_prefix=False)
+
+
 def _cycle(cm, stub, req, tokens):
     """One gamma=1 verify cycle: two positions computed, `tokens` committed."""
     back = req.device_len
@@ -291,20 +299,36 @@ def test_an_aborted_cycle_publishes_no_token_and_no_prefix():
 
 # ------------------------------------------------------- the contract refuses bad callers
 
-def test_commit_refuses_a_caller_that_did_not_advance_the_request():
-    """verify_forward does not call complete_one; if its caller forgets, the commit must
-    say so rather than append a token onto a stale frontier."""
+def test_speculative_commit_refuses_a_stale_frontier():
+    """verify_forward does not call complete_one; the speculative commit makes that call and
+    checks it landed. The check lives there, not in _commit_token: the normal drain runs
+    under overlap scheduling, where the NEXT batch's complete_one has already moved
+    cached_len one past the history by the time this token is committed."""
+    _pool, cm, tm, dm, stub, _sent, _pub = _setup()
+    req = _req(cm, tm)
+    dm.filter_reqs([req])
+    req.complete_one()                      # a forward already advanced it ...
+    try:
+        _cycle(cm, stub, req, [ord("a")])   # ... and the cycle advances it again
+    except AssertionError as e:
+        assert "frontier" in str(e), e
+    else:
+        raise AssertionError("a stale frontier was accepted")
+
+
+def test_the_normal_drain_accepts_an_overlapped_request():
+    """The real cost of getting the contract wrong: overlap_loop launches batch N+1 BEFORE
+    draining batch N, so at commit time cached_len is one AHEAD of the history. An assert
+    demanding the strict relation here takes down ordinary serving -- it did, on a chunked
+    prefill's commit, the first time a real generation was run through it."""
     _pool, cm, tm, dm, stub, _sent, _pub = _setup()
     req = _req(cm, tm)
     dm.filter_reqs([req])
     cm.allocate_paged([req])
-    try:
-        stub._commit_token(req, torch.tensor(ord("a"), dtype=torch.int32),
-                           reply=[], new_finished_reqs=set(), publish_prefix=False)
-    except AssertionError as e:
-        assert "frontier" in str(e)
-    else:
-        raise AssertionError("a stale frontier was accepted")
+    req.complete_one()                      # this batch's forward
+    req.complete_one()                      # the NEXT batch, launched before this drain
+    assert req.cached_len == req.input_ids.numel() + 1
+    assert not _step_raw(cm, stub, req, ord("a"))
 
 
 def test_speculative_commit_refuses_a_logprobs_request():
