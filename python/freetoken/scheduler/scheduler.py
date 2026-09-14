@@ -451,7 +451,17 @@ class Scheduler(SchedulerIOMixin):
         row_chosen_logprob, row_top_ids, row_top_logprobs = logprob_row
         # EOS / stop-string -> "stop", output budget exhausted -> "length";
         # EOS and stop strings win over length.
-        hit_length = not req.can_decode
+        #
+        # The budget is a LOGICAL quantity: how many tokens this request has PUBLISHED.
+        # ``can_decode`` answers a different question -- may another forward be scheduled --
+        # and reads ``device_len``, which overlap scheduling advances before this drain runs
+        # (``overlap_loop`` launches batch N+1, then drains N). Reading it here retired a
+        # request one token early: max_tokens=8 published 7. And not by a constant either --
+        # ``_schedule_next_batch`` prefers prefill, so when the next batch went to someone
+        # else's prompt this request's counter did not move and the same code published 8.
+        # ``can_decode`` itself is unchanged: filter_reqs and the KV reservations still want
+        # execution progress. What is separated here is the termination decision.
+        hit_length = req.input_ids.numel() - req.prompt_len >= req.output_len
         hit_eos = (
             not req.sampling_params.ignore_eos and tok in self.eos_token_ids
         ) or tok in req.sampling_params.stop_token_ids

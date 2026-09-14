@@ -203,6 +203,68 @@ def test_prefill_publishes_the_prefix_and_a_decode_step_does_not():
     assert published == [(len(PROMPT), False)], "a decode step publishes nothing"
 
 
+def _overlapped_run(cm, stub, req, tokens):
+    """Drive commits the way ``overlap_loop`` does.
+
+    The loop LAUNCHES the next batch (``_schedule_next_batch`` + ``_forward``, which calls
+    ``complete_one``) and only then drains the previous one. So every commit but the last
+    sees a request that a later forward has already advanced.
+    """
+    out = []
+    req.complete_one()                      # the prefill forward
+    for tok in tokens:
+        if req.can_decode:                  # the next batch is scheduled for it, and launched
+            cm.allocate_paged([req])
+            req.complete_one()
+        with cm.lazy_free_region():
+            fin = stub._commit_token(req, torch.tensor(tok, dtype=torch.int32),
+                                     reply=[], new_finished_reqs=set(), publish_prefix=False)
+        out.append(tok)
+        if fin:
+            break
+    return out
+
+
+def test_output_budget_counts_published_tokens_not_forward_progress():
+    """max_tokens=N must publish N tokens under overlap scheduling too.
+
+    Reading ``can_decode`` here published N-1: the next batch's ``complete_one`` had already
+    moved ``device_len`` past the history by the time the token was committed.
+    """
+    for budget in (1, 2, 3, 5):
+        _pool, cm, tm, dm, stub, _sent, _pub = _setup()
+        req = _req(cm, tm, output_len=budget)
+        dm.filter_reqs([req])
+        got = _overlapped_run(cm, stub, req, [ord("a") + i for i in range(budget + 2)])
+        assert len(got) == budget, f"max_tokens={budget} published {len(got)}"
+
+
+def test_the_published_count_does_not_depend_on_the_schedule():
+    """The old rule's error was not a constant, which is why a fixed correction cannot undo
+    it. ``_schedule_next_batch`` prefers prefill: when the next slot goes to someone else's
+    prompt, the decoding request's ``device_len`` does not move and ``not can_decode``
+    published N; when it gets the slot, the same code published N-1. Same request, same
+    budget, two schedules -- the published count must be N in both."""
+    def run(skip_launch_at):
+        _pool, cm, tm, dm, stub, _sent, _pub = _setup()
+        req = _req(cm, tm, output_len=3)
+        dm.filter_reqs([req])
+        req.complete_one()                              # prefill forward
+        n = 0
+        for k, tok in enumerate([ord("a"), ord("b"), ord("c"), ord("d"), ord("e")]):
+            if k != skip_launch_at and req.can_decode:  # the next batch is launched for it
+                cm.allocate_paged([req])
+                req.complete_one()
+            n += 1
+            if _step_raw(cm, stub, req, tok):
+                break
+        return n
+
+    every_step = run(None)      # this request gets every slot
+    one_to_prefill = run(1)     # step 1's slot went to another request's prefill
+    assert every_step == one_to_prefill == 3, (every_step, one_to_prefill)
+
+
 # ------------------------------------------------------------------ speculative path
 
 def test_accepted_pair_commits_both_tokens_in_order():
