@@ -403,3 +403,89 @@ def test_speculative_commit_refuses_a_logprobs_request():
         assert "logprobs" in str(e)
     else:
         raise AssertionError("a logprobs request went through the verify commit")
+
+
+# ------------------------------------- hybrid: the state donated at finish must match its key
+
+def _verify_absorbs(pool, req, n):
+    """What a real ``verify_forward`` leaves behind: the live GDN slot has absorbed n more
+    positions, and the request carries the frontier that reached. The absorbed length is
+    written INTO the slot here so the donated clone can be checked against its key; on the
+    real path it is the recurrence itself (systest ``spec_commit_contract.py`` asserts that
+    ``verify_forward`` sets the marker)."""
+    frontier = req.cached_len + n
+    pool.recurrent_states[:, req.linear_slot_idx] = float(frontier)
+    pool.conv_states[:, req.linear_slot_idx] = float(frontier)
+    req.linear_state_len = frontier
+
+
+def _donation_at(cm, pool, key_ids):
+    """(absorbed positions, key length) of whatever the tree holds at this key, or None."""
+    m = cm.prefix_cache.match_prefix(key_ids)
+    if m.mamba_value is None:
+        return None
+    return int(pool.recurrent_states[0, m.mamba_value].flatten()[0].item()), m.cached_len
+
+
+def _mid_decode(cm, tm, stub, dm, *, steps=2):
+    """A request two decode steps in: cached_len == len(input_ids) - 1, live state at cached_len."""
+    req = _req(cm, tm, output_len=8)
+    dm.filter_reqs([req])
+    for i in range(steps):
+        _step(cm, stub, req, ord("a") + i)
+    assert req.cached_len == req.input_ids.numel() - 1 == req.device_len - 1
+    return req
+
+
+def test_a_suppressed_bonus_must_not_donate_a_state_that_ran_past_its_key():
+    """gamma=1 verifies TWO positions into the live GDN slot. If the draft terminates the
+    request only ONE of them is committed, so the live state has consumed a token that the
+    committed prefix does not contain -- and the finish-donate attaches that live state to
+    ``input_ids[:cached_len]``. A later request matching that key would resume from a state
+    that already ate its next token. Shortening cached_len does not rewind the GDN state, so
+    the publication is skipped: nothing at that key, or something that matches it."""
+    pool, cm, tm, dm, stub, _sent, _pub = _setup()
+    req = _mid_decode(cm, tm, stub, dm)
+    _verify_absorbs(pool, req, 2)                       # positions p+1 and p+2
+    assert _cycle(cm, stub, req, [EOS, ord("z")]) == 1  # bonus suppressed, request retired
+    got = _donation_at(cm, pool, req.input_ids[: req.cached_len])
+    assert got is None or got[0] == got[1], (
+        f"donated a state that absorbed {got and got[0]} positions at a "
+        f"{got and got[1]}-token key"
+    )
+
+
+def test_an_aborted_cycle_must_not_donate_its_live_state_either():
+    """Same defect, two positions wide: an abort commits nothing, so the live state is ahead
+    by the whole verify width."""
+    pool, cm, tm, dm, stub, _sent, _pub = _setup()
+    req = _mid_decode(cm, tm, stub, dm)
+    _verify_absorbs(pool, req, 2)
+    req.aborted = True
+    assert _cycle(cm, stub, req, [ord("y"), ord("z")]) == 0
+    got = _donation_at(cm, pool, req.input_ids[: req.cached_len])
+    assert got is None or got[0] == got[1], got
+
+
+def test_a_fully_accepted_pair_still_donates_its_state():
+    """The guard must not swallow the normal case: both tokens committed means the state and
+    the key agree, and the donation is the deepest reuse point this request can leave."""
+    pool, cm, tm, dm, stub, _sent, _pub = _setup()
+    req = _mid_decode(cm, tm, stub, dm)
+    _verify_absorbs(pool, req, 2)
+    assert _cycle(cm, stub, req, [ord("y"), ord("z")]) == 2
+    assert req.linear_state_len is None, "back in sync; the marker must be cleared"
+    stub._retire_req(req, set())                        # finish it normally
+    got = _donation_at(cm, pool, req.input_ids[: req.cached_len])
+    assert got == (req.cached_len, req.cached_len), (got, req.cached_len)
+
+
+def test_a_normal_request_is_unaffected_by_the_guard():
+    """No verify ever ran: the marker stays None and the ordinary finish-donate happens."""
+    pool, cm, tm, dm, stub, _sent, _pub = _setup()
+    req = _mid_decode(cm, tm, stub, dm)
+    assert req.linear_state_len is None
+    pool.recurrent_states[:, req.linear_slot_idx] = float(req.cached_len)
+    stub._retire_req(req, set())
+    got = _donation_at(cm, pool, req.input_ids[: req.cached_len])
+    assert got == (req.cached_len, req.cached_len), got

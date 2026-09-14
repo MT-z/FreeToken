@@ -132,6 +132,14 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # How many positions the LIVE GDN slot has absorbed, when that is not ``cached_len``.
+    # None means the two agree, which is how every normal forward leaves them: one
+    # ``complete_one`` per forward, one position absorbed. A speculative verify breaks it --
+    # it absorbs gamma+1 positions and the caller may commit fewer -- and the finish-donate
+    # attaches the LIVE slot to ``input_ids[:cached_len]``, so a state that ran past its key
+    # would become a reuse point for the next request that matches it. Shortening cached_len
+    # does not rewind the recurrence, so the publication has to be skipped instead.
+    linear_state_len: int | None = None
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu

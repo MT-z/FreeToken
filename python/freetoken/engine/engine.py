@@ -1178,6 +1178,11 @@ class Engine:
 
         batch.verify = True
         batch.verify_hidden = None
+        # Record the frontier the GDN slot is about to reach, BEFORE the forward: a verify
+        # that fails partway has still moved the state, and the marker has to survive that
+        # (the conservative direction -- it only ever suppresses a publication). The caller
+        # clears it when it has committed that many positions.
+        batch.reqs[0].linear_state_len = batch.reqs[0].cached_len + batch.input_ids.numel()
         try:
             with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, False):
                 logits = self.model.forward()

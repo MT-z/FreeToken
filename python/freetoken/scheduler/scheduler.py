@@ -589,6 +589,10 @@ class Scheduler(SchedulerIOMixin):
                         publish_prefix=False,
                     )
                     published += 1
+                    if req.linear_state_len == req.cached_len:
+                        # back in sync: everything the verify absorbed is now committed, so
+                        # the live state IS the state for this prefix and may be donated.
+                        req.linear_state_len = None
                     if finished:
                         break
         self.finished_reqs = new_finished_reqs

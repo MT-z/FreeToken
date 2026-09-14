@@ -409,7 +409,16 @@ class CacheManager:
             # remain as reuse points).
             insert_len = align_down(req.cached_len, self.page_size)
             keep_live = False
-            if insert_len == req.cached_len and insert_len > 0:
+            # A speculative verify absorbs gamma+1 positions; if fewer were committed the live
+            # state has eaten a token this key does not contain. Donating it would hand the
+            # next request that matches the key a state that is already past it -- the same
+            # propagation the failed-request path refuses, arriving through the SUCCESS path.
+            # The track-ring snapshot above is unaffected: it was frozen at its own boundary.
+            state_synced = req.linear_state_len is None or req.linear_state_len == req.cached_len
+            if not state_synced:
+                _pfx(f"skip[finish] live state at {req.linear_state_len} != "
+                     f"cached_len {req.cached_len}: not donating")
+            if insert_len == req.cached_len and insert_len > 0 and state_synced:
                 clone = self._clone_slot_for_tree(req.linear_slot_idx)
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     req.input_ids[:insert_len], page_indices[:insert_len], clone)
