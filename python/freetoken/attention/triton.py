@@ -157,8 +157,13 @@ class TritonAttentionBackend(BaseAttnBackend):
         v_cache = v_raw.view(-1, kv_heads, head_dim)
         # An fp8 KV pool hands us its per-(token, head) scales; a 16-bit pool returns
         # None and every kernel below keeps its original (scale-free) code path.
-        k_scale = self.kvcache.k_scale(layer_id)
-        v_scale = self.kvcache.v_scale(layer_id)
+        # getattr: upstream's backend tests drive this with KV-cache fakes that predate the
+        # fp8 scales (the same stub shape #300 flagged for the scheduler hooks); an absent
+        # accessor means "not an fp8 pool", which is the scale-free path either way.
+        _ks = getattr(self.kvcache, "k_scale", None)
+        _vs = getattr(self.kvcache, "v_scale", None)
+        k_scale = _ks(layer_id) if _ks is not None else None
+        v_scale = _vs(layer_id) if _vs is not None else None
         assert (k_scale is None) == (v_scale is None), "K and V scales come as a pair"
 
         spec = attn_spec or AttentionSpec()
