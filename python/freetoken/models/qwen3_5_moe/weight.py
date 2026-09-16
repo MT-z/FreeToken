@@ -122,9 +122,7 @@ class _DenseReader:
             for idx, part in enumerate(parts):
                 self.by_part.setdefault(part, []).append((fused, idx))
         # target module -> (part count, {part: {role: tensor}}, {part: the roles its module stores})
-        self.pending: dict[str, tuple[int, dict[int, dict[str, torch.Tensor]], dict[int, set[str]]]] = {}
-        # the scheme each pending target was stored under, for finalize()
-        self._stored: dict[str, QuantScheme | None] = {}
+        self.pending: dict[str, tuple[int, dict[int, dict[str, torch.Tensor]], dict[int, set[str]], QuantScheme | None]] = {}
 
     def scheme(self, module: str) -> QuantScheme | None:
         return None if self.quant is None else self.quant.scheme_for(module)
@@ -165,9 +163,10 @@ class _DenseReader:
             )
         if stored is None and tensor.dtype in _QUANT_DTYPES:
             raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} unquantized")
+        if stored is not None and role == "weight" and tensor.dtype is not _ELEM_DTYPES[stored.weight.elem]:
+            raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} {stored}")
         target, idx, count = self.target(module)
-        _, parts, expected = self.pending.setdefault(target, (count, {}, {}))
-        self._stored[target] = stored
+        _, parts, expected, _ = self.pending.setdefault(target, (count, {}, {}, stored))
         parts.setdefault(idx, {})[role] = tensor
         expected[idx] = set(roles.values())
         if len(parts) < count or any(set(parts[i]) != expected[i] for i in parts):
@@ -176,31 +175,19 @@ class _DenseReader:
         self._stored.pop(target, None)
         return self._emit(target, [parts[i] for i in range(count)], stored)
 
-    def finalize(self) -> Iterator[tuple[str, torch.Tensor]]:
-        """Emit the targets the checkpoint completed except for optional roles, then report the rest.
-
-        A scheme declares every role its kind can carry; a given export stores a subset. Waiting
-        for a role the checkpoint never had turns a loadable checkpoint into a missing-tensor
-        error -- which is what Ornith-1.5-35B-A3B-NVFP4 hit: its shared_expert projections and
-        lm_head store weight / weight_scale / weight_scale_2 and no input_scale.
-        """
-        for target in sorted(self.pending):
-            count, parts, expected = self.pending[target]
+    def missing(self) -> list[str]:
+        """One line per incomplete module: the roles its parts still lack."""
+        lines = []
+        for target, (count, parts, expected, stored) in sorted(self.pending.items()):
+            lacking = sorted(set().union(*(expected[i] - set(parts[i]) for i in parts)))
+            note = ""
+            if lacking == ["input_scale"]:
+                fix = "declares W4A16_NVFP4 or sets with_input_scale false" if stored is not None and stored.kind is QuantKind.NVFP4 else "sets with_input_scale false"
+                note = f" (an export without activation scales {fix})"
             if len(parts) < count:
-                continue
-            missing = {i: expected[i] - set(parts[i]) for i in parts}
-            if any(m - set(_OPTIONAL_ROLES) for m in missing.values()):
-                continue
-            if not any(missing.values()):
-                continue  # complete but unemitted: a bug here, not an optional role
-            for i, roles in missing.items():
-                ref = next(iter(parts[i].values()))
-                for role in roles:
-                    parts[i][role] = torch.tensor(
-                        _OPTIONAL_ROLES[role], dtype=torch.float32, device=ref.device
-                    )
-            del self.pending[target]
-            yield from self._emit(target, [parts[i] for i in range(count)], self._stored.pop(target, None))
+                lacking.append(f"{count - len(parts)} of {count} fused parts")
+            lines.append(f"{target}: missing {lacking}{note}")
+        return lines
 
     def _emit(self, target: str, parts: list[dict[str, torch.Tensor]], stored: QuantScheme | None):
         if stored is not None:
@@ -298,10 +285,20 @@ def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | N
                     yield name, tensor + 1.0  # (1 + weight) baked into the stored norm weight
                 else:
                     yield name, tensor
-    if reader is not None:
-        yield from reader.finalize()
-        if reader.pending:
-            raise ValueError(f"checkpoint is missing tensors of {sorted(reader.pending)}")
+    if reader is not None and reader.pending:
+        lines = reader.missing()
+        shown = "\n  ".join(lines[:8]) + (f"\n  ... {len(lines) - 8} more" if len(lines) > 8 else "")
+        raise ValueError(f"checkpoint is missing tensors the quant config declares for {len(lines)} modules:\n  {shown}")
+
+
+def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The vision tower alone, named as iter_weights names it."""
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for raw_name in f.keys():
+                name = _rename(raw_name)
+                if name is not None and name.startswith(VISION_KEY_PREFIXES):
+                    yield name, f.get_tensor(raw_name)
 
 
 def iter_weights_parallel(

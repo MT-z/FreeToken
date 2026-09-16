@@ -400,9 +400,6 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
             images=images,
-            # getattr: this branch's API tests drive the handlers with namespace stubs that
-            # carry no mm config; an absent budget means "the processor's own limit".
-            mm_max_pixels=getattr(getattr(state.config, "mm", None), "max_pixels", None),
         )
     )
     return uid
@@ -435,7 +432,6 @@ async def count_prompt_tokens(
         chat_template_kwargs=chat_template_kwargs,
         tools=tools,
         images=images,
-        mm_max_pixels=getattr(getattr(state.config, "mm", None), "max_pixels", None),
     )
     manager = await asyncio.to_thread(state.frontend_tokenizer)  # init failure -> server fault
     try:

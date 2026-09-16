@@ -25,7 +25,7 @@ def _config(**overrides):
     text_model_only = overrides.pop("text_model_only", False)
     serves_images = overrides.pop("vision_enabled", False)
     mm = SimpleNamespace(
-        text_model_only=text_model_only, max_pixels=None,
+        text_model_only=text_model_only,
         disabled_encoders=frozenset({"vision", "audio"}) if text_model_only else frozenset(),
     )
     return SimpleNamespace(mm=mm, served_modalities=frozenset({"image"}) if serves_images else frozenset(), **{**fields, **overrides})
@@ -122,3 +122,21 @@ def test_local_media_requires_allowlisted_root(tmp_path):
     # a path outside the root is rejected even with the gate on
     with pytest.raises(ValueError, match="subpath"):
         asyncio.run(fetch_image_bytes([{"kind": "url", "data": "file:///etc/hostname"}], config))
+
+
+def test_image_token_budget_flags_land_in_the_multimodal_config():
+    from unittest.mock import patch
+
+    from freetoken.server.args import parse_args
+
+    hf = SimpleNamespace(to_dict=lambda: {"architectures": ["Qwen3VLForConditionalGeneration"], "torch_dtype": "bfloat16"})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: hf):
+        args, _ = parse_args([
+            "--model", "/models/anon", "--image-min-tokens", "64", "--image-max-tokens", "1024",
+            "--mm-processor-kwargs", '{"size": {"longest_edge": 4096}}',
+        ])
+        assert (args.mm.image_min_tokens, args.mm.image_max_tokens) == (64, 1024)
+        assert args.mm.processor_kwargs == {"size": {"longest_edge": 4096}}
+        assert parse_args(["--model", "/models/anon"])[0].mm.processor_kwargs == {}
+        with pytest.raises(SystemExit):  # argparse reports the bad pair and exits
+            parse_args(["--model", "/models/anon", "--image-min-tokens", "2048", "--image-max-tokens", "1024"])

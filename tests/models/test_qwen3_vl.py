@@ -41,7 +41,7 @@ def _engine_config(monkeypatch, hf, processor, **overrides):
 
     monkeypatch.setattr(engine_config, "cached_load_hf_config", lambda path: hf)
     monkeypatch.setattr(engine_config, "checkpoint_quant_config", lambda *args: None)
-    monkeypatch.setattr(mm_processor, "get_mm_processor", lambda path: processor)
+    monkeypatch.setattr(mm_processor, "get_mm_processor", lambda path, mm=None: processor)
     return EngineConfig(
         model_path="/fake", tp_info=DistributedInfo(rank=0, size=1), dtype=torch.bfloat16, **overrides
     )

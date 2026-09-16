@@ -5,12 +5,15 @@ import json
 import os
 import threading
 from types import ModuleType
-from typing import Any, List
+from typing import TYPE_CHECKING, Any, List
 
 import torch
 from freetoken.message import TokenizeMsg, UserMsg
 from freetoken.utils import init_logger
 from transformers import PreTrainedTokenizerBase
+
+if TYPE_CHECKING:
+    from freetoken.mm.processor import MMProcessor
 
 from .effort import (
     EffortProfile,
@@ -60,8 +63,9 @@ def _map_developer_role(
 
 
 class TokenizeManager:
-    def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, mm_processor: MMProcessor | None = None) -> None:
         self.tokenizer = tokenizer
+        self.mm_processor = mm_processor  # None: the model takes no images
         self._dsv4_encoder = _load_dsv4_encoder_if_needed(tokenizer)
         self._effort_profile: EffortProfile | None = None
         self._thinking_profile: ThinkingProfile | None = None
@@ -86,12 +90,9 @@ class TokenizeManager:
             )
             input_ids = input_ids.view(-1).to(torch.int32)
             if msg.images:
-                from freetoken.mm.processor import get_mm_processor
-
-                processor = get_mm_processor(getattr(self.tokenizer, "name_or_path", ""))
-                if processor is None:
+                if self.mm_processor is None:
                     raise ValueError("image input is not supported for this model")
-                mm = processor.apply(input_ids, msg.images, msg.mm_max_pixels)
+                mm = self.mm_processor.apply(input_ids, msg.images)
                 results.append(
                     UserMsg(
                         uid=msg.uid,

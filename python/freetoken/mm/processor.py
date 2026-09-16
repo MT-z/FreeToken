@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 import hashlib
 import importlib
 import io
+import threading
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any
 
 import torch
 
 from freetoken.message import MMItem
+from freetoken.mm.config import MultimodalConfig
 from freetoken.mm import check_mm_pad_shift
 
 
@@ -62,7 +64,7 @@ def _find_all(ids: list[int], target: list[int]) -> list[int]:
     return found
 
 
-class MMProcessor:
+class MMProcessor(ABC):
     """How a checkpoint's images become items, tokens and positions; apply is the family-agnostic driver, subclasses fill the hooks.
 
     Built from the checkpoint config alone and import-light: tokenizer workers call apply without the model layer, the engine calls dummy_items.
@@ -72,25 +74,42 @@ class MMProcessor:
     # the token sequence the chat template renders once per image
     placeholder: list[int]
 
-    def process(self, images: list[Any], max_pixels: int | None) -> list[MMItem]:
-        """One MMItem per image with feature and hash; offsets are assigned by apply."""
-        raise NotImplementedError
+    def __init__(self, model_path: str, mm: MultimodalConfig) -> None:
+        self.model_path = model_path
+        self.mm = mm
+        self._image_processor_instance: Any = None
+        self._image_processor_lock = threading.Lock()
 
+    def _image_processor(self) -> Any:
+        """The checkpoint's image processor, loaded on first use (tokenizer workers share the instance across threads)."""
+        with self._image_processor_lock:
+            if self._image_processor_instance is None:
+                from transformers import AutoImageProcessor
+
+                self._image_processor_instance = AutoImageProcessor.from_pretrained(self.model_path)
+            return self._image_processor_instance
+
+    def get_mm_processor_kwargs(self, mm: MultimodalConfig) -> dict[str, Any]:
+        """Keyword arguments for the checkpoint processor call: the family's reading of the mm knobs, then mm.processor_kwargs on top; families with a token budget override this."""
+        return dict(mm.processor_kwargs)
+
+    @abstractmethod
+    def process(self, images: list[Any]) -> list[MMItem]:
+        """One MMItem per image with feature and hash; offsets are assigned by apply."""
+
+    @abstractmethod
     def prompt_replacement(self, item: MMItem) -> PromptReplacement:
         """The token sequence that stands in for this item's placeholder in the prompt."""
-        raise NotImplementedError
 
     def positions(self, length: int, items: list[MMItem]) -> tuple[torch.Tensor, int] | None:
         """[3, length] t/h/w rope positions and the decode delta; None for 1-D rope families."""
         return None
 
+    @abstractmethod
     def dummy_items(self, dtype: torch.dtype, device: torch.device) -> list[MMItem]:
         """The smallest encodable item of each modality the family serves, for warming the encoders."""
-        raise NotImplementedError
 
-    def apply(
-        self, input_ids: torch.Tensor, images: list[bytes], max_pixels: int | None
-    ) -> MMResult:
+    def apply(self, input_ids: torch.Tensor, images: list[bytes]) -> MMResult:
         """Swap each image placeholder for its replacement sequence and precompute rope positions."""
         from PIL import Image
 
@@ -104,7 +123,7 @@ class MMProcessor:
             )
 
         pils = [Image.open(io.BytesIO(raw)).convert("RGB") for raw in images]
-        items = self.process(pils, max_pixels)
+        items = self.process(pils)
         out: list[int] = []
         cursor = 0
         for slot, item in zip(slots, items):
@@ -167,9 +186,8 @@ def content_hash(feature: torch.Tensor, extra: bytes = b"") -> int:
     return int.from_bytes(hasher.digest()[:8], "little") % (1 << 62)
 
 
-@lru_cache(maxsize=4)
-def get_mm_processor(model_path: str) -> MMProcessor | None:
-    """The family's processor, or None when the family takes no multimodal input or the checkpoint ships none of its encoders."""
+def get_mm_processor(model_path: str, mm: MultimodalConfig | None = None) -> MMProcessor | None:
+    """A processor for the checkpoint under the mm knobs, or None when no encoder is left to serve: the family registers none, the checkpoint ships none, or mm.disabled_encoders names them all; callers keep the instance, it holds the loaded image processor."""
     from freetoken.models.register import get_model_spec
     from freetoken.utils import cached_load_hf_config
 
@@ -178,11 +196,13 @@ def get_mm_processor(model_path: str) -> MMProcessor | None:
         spec = get_model_spec((config.architectures or [None])[0])
     except Exception:  # noqa: BLE001 -- missing/foreign config or unknown architecture: no multimodal input
         return None
-    if spec.mm_processor is None or all(getattr(config, e.config_key, None) is None for e in spec.encoders):
+    mm = mm or MultimodalConfig()
+    served = [e for e in spec.encoders if getattr(config, e.config_key, None) is not None and e.kind not in mm.disabled_encoders]
+    if spec.mm_processor is None or not served:
         return None
     check_mm_pad_shift(config.text_config.vocab_size)
     module, _, cls = spec.mm_processor.partition(":")
-    return getattr(importlib.import_module(module), cls)(config, model_path)
+    return getattr(importlib.import_module(module), cls)(config, model_path, mm)
 
 
 __all__ = [

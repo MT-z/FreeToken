@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import json
 import os
 from dataclasses import dataclass, field
 from typing import List, Tuple
@@ -128,6 +129,16 @@ class ServerArgs(SchedulerConfig):
     @property
     def distributed_addr(self) -> str:
         return f"tcp://127.0.0.1:{self.server_port + 1}"
+
+
+def _json_object(text: str) -> dict:
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"not valid JSON: {exc}") from None
+    if not isinstance(value, dict):
+        raise argparse.ArgumentTypeError("expected a JSON object")
+    return value
 
 
 def parse_args(
@@ -539,11 +550,74 @@ def parse_args(
     )
 
     parser.add_argument(
-        "--mm-max-pixels",
+        "--mm-embed-cache-device",
+        choices=["cpu", "cuda"],
+        default=MultimodalConfig.embed_cache_device,
+        help="Storage for encoded image embeddings between prefill chunks.",
+    )
+
+    parser.add_argument(
+        "--mm-encoder-weights",
+        choices=["gpu", "host"],
+        default=MultimodalConfig.encoder_weights,
+        help="Encoder tower block weights: pinned host banks streamed two blocks at a time behind the "
+        "compute (default, about 60 MiB of VRAM instead of the whole tower), or resident on the GPU.",
+    )
+
+    parser.add_argument(
+        "--allowed-media-domains",
+        type=str,
+        default=ServerArgs.allowed_media_domains,
+        help="Comma-separated hostname allowlist for client-supplied image URLs. "
+        "Empty (default) allows any domain.",
+    )
+
+    parser.add_argument(
+        "--allowed-local-media-path",
+        type=str,
+        default=ServerArgs.allowed_local_media_path,
+        help="Directory that file:// image refs may be read from. "
+        "Unset (default) rejects local files.",
+    )
+
+    parser.add_argument(
+        "--text-model-only",
+        action="store_true",
+        default=False,
+        help="Serve a multimodal checkpoint text-only: no encoder tower is built (its VRAM goes to "
+        "the KV/expert pools) and every multimodal input is rejected. Same as --mm-disable with "
+        "every encoder kind.",
+    )
+    parser.add_argument(
+        "--mm-disable",
+        nargs="+",
+        choices=list(ENCODER_KINDS),
+        default=[],
+        metavar="{vision,audio}",
+        help="Encoder towers to leave unbuilt; every input they would serve is rejected.",
+    )
+
+    parser.add_argument(
+        "--image-min-tokens",
         type=_positive_int,
-        default=MultimodalConfig.max_pixels,
-        help="Per-image pixel budget handed to the image processor (larger images are "
-        "downscaled). Default: the processor's own limit.",
+        default=MultimodalConfig.image_min_tokens,
+        help="Fewest tokens an image may take: the image processor scales smaller images up to it, "
+        "in the family's own units. Default: the processor's own limit.",
+    )
+    parser.add_argument(
+        "--image-max-tokens",
+        type=_positive_int,
+        default=MultimodalConfig.image_max_tokens,
+        help="Most tokens an image may take: the image processor scales larger images down to it, "
+        "in the family's own units (Qwen VL: one token per 32x32 pixels). Default: the processor's own limit.",
+    )
+    parser.add_argument(
+        "--mm-processor-kwargs",
+        type=_json_object,
+        default=None,
+        metavar="JSON",
+        help="JSON object of extra keyword arguments for the checkpoint's image processor call, "
+        "for family-specific knobs; applied after the token budget.",
     )
 
     parser.add_argument(
@@ -1069,11 +1143,16 @@ def parse_args(
 
     disabled = set(ENCODER_KINDS) if kwargs.pop("text_model_only") else set()
     disabled.update(kwargs.pop("mm_disable"))
+    image_min_tokens, image_max_tokens = kwargs.pop("image_min_tokens"), kwargs.pop("image_max_tokens")
+    if image_min_tokens is not None and image_max_tokens is not None and image_min_tokens > image_max_tokens:
+        parser.error(f"--image-min-tokens {image_min_tokens} exceeds --image-max-tokens {image_max_tokens}")
     kwargs["mm"] = MultimodalConfig(
         disabled_encoders=frozenset(disabled),
         embed_cache_device=kwargs.pop("mm_embed_cache_device"),
         encoder_weights=kwargs.pop("mm_encoder_weights"),
-        max_pixels=kwargs.pop("mm_max_pixels"),
+        image_min_tokens=image_min_tokens,
+        image_max_tokens=image_max_tokens,
+        processor_kwargs=kwargs.pop("mm_processor_kwargs") or {},
     )
     result = ServerArgs(**kwargs)
     logger.info(f"Parsed arguments:\n{result}")

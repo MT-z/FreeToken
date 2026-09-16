@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 # encoder tower kinds a family can register; --mm-disable <kind> leaves that tower unbuilt and refuses its inputs
 ENCODER_KINDS = ("vision", "audio")
@@ -19,8 +19,11 @@ class MultimodalConfig:
     embed_cache_device: Literal["cpu", "cuda"] = "cpu"
     # Encoder tower block weights. "host": pinned host banks streamed two blocks at a time behind the compute, "gpu": resident.
     encoder_weights: Literal["gpu", "host"] = "host"
-    # Pixel budget the processor resizes each image into. None: the checkpoint's own default (Qwen VL: 16,777,216 = 4096x4096).
-    max_pixels: int | None = None
+    # per-image token budget; the family's MMProcessor converts it to its image processor's own limits, None keeps the checkpoint defaults
+    image_min_tokens: int | None = None
+    image_max_tokens: int | None = None
+    # extra keyword arguments the family's MMProcessor passes to the image processor call, after the token budget
+    processor_kwargs: dict[str, Any] = field(default_factory=dict)
 
     @property
     def text_model_only(self) -> bool:

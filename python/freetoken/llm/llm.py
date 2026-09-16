@@ -40,6 +40,9 @@ class LLM(Scheduler):
         self.pending_requests: List[Tuple[List[int] | str, SamplingParams, List[bytes] | None]] = []
         self.status_map: Dict[int, RequestStatus] = {}
         self.counter = 0
+        from freetoken.mm.processor import get_mm_processor
+
+        self._mm_processor = get_mm_processor(model_path, config.mm)
 
     def _tokenize_one(self, prompt: List[int] | str) -> torch.Tensor:
         if isinstance(prompt, str):
@@ -58,12 +61,9 @@ class LLM(Scheduler):
             input_ids = self._tokenize_one(tokens_or_prompt)
             msg = UserMsg(uid=0, input_ids=input_ids, sampling_params=sampling_params)
             if images:
-                from freetoken.mm.processor import get_mm_processor
-
-                processor = get_mm_processor(self.config.model_path)
-                if processor is None:
+                if self._mm_processor is None:
                     raise ValueError("image input is not supported for this model")
-                r = processor.apply(input_ids, images, max_pixels=None)
+                r = self._mm_processor.apply(input_ids, images)
                 input_ids = r.input_ids
                 msg = UserMsg(
                     uid=0,

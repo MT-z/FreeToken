@@ -3,44 +3,42 @@
 from __future__ import annotations
 
 import struct
-import threading
 from typing import Any
 
 import torch
 
 from freetoken.message import MMItem
 from freetoken.mm import mm_pad_value
+from freetoken.mm.config import MultimodalConfig
 from freetoken.mm.processor import MMProcessor, PromptReplacement, content_hash, image_positions
 
 
 class QwenVLMMProcessor(MMProcessor):
-    def __init__(self, hf_config: Any, model_path: str) -> None:
-        self.model_path = model_path
+    def __init__(self, hf_config: Any, model_path: str, mm: MultimodalConfig) -> None:
+        super().__init__(model_path, mm)
         vc = hf_config.vision_config
         self.image_token_id = hf_config.image_token_id
         self.placeholder = [self.image_token_id]
         self.merge = vc.spatial_merge_size
+        self.pixels_per_token = (vc.patch_size * vc.spatial_merge_size) ** 2
         self.patch_dim = vc.in_channels * vc.temporal_patch_size * vc.patch_size**2
         self.is_mrope = "mrope_section" in hf_config.text_config.rope_parameters
-        self._processor: Any = None
-        self._lock = threading.Lock()
 
-    def _image_processor(self) -> Any:
-        with self._lock:
-            if self._processor is None:
-                from transformers import AutoImageProcessor
-
-                self._processor = AutoImageProcessor.from_pretrained(self.model_path)
-            return self._processor
-
-    def process(self, images: list[Any], max_pixels: int | None) -> list[MMItem]:
-        processor = self._image_processor()
+    def get_mm_processor_kwargs(self, mm: MultimodalConfig) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"return_tensors": "pt"}
-        if max_pixels is not None:
-            # the pixel budget travels in size.longest_edge; a bare max_pixels kwarg is ignored
-            size = dict(processor.size)
-            size["longest_edge"] = max_pixels
+        if mm.image_min_tokens is not None or mm.image_max_tokens is not None:
+            # the budget travels as pixel areas in size.shortest_edge / longest_edge; bare min/max_pixels kwargs are ignored
+            size = dict(self._image_processor().size)
+            if mm.image_min_tokens is not None:
+                size["shortest_edge"] = mm.image_min_tokens * self.pixels_per_token
+            if mm.image_max_tokens is not None:
+                size["longest_edge"] = mm.image_max_tokens * self.pixels_per_token
             kwargs["size"] = size
+        return {**kwargs, **mm.processor_kwargs}
+
+    def process(self, images: list[Any]) -> list[MMItem]:
+        processor = self._image_processor()
+        kwargs = self.get_mm_processor_kwargs(self.mm)
         items: list[MMItem] = []
         for pil in images:
             out = processor(images=pil, **kwargs)

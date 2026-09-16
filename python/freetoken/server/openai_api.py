@@ -246,7 +246,10 @@ async def handle_chat_completion(
 
     # n > 1: one generation per choice, submitted together (the prefix cache serves the
     # shared prompt after the first prefill).
-    uids = [await submit_generation(spec, state) for _ in range(req.n)]
+    try:
+        uids = [await submit_generation(spec, state) for _ in range(req.n)]
+    except GenerationError as exc:
+        return create_error_response(str(exc), code=exc.code)
     uid = uids[0]
 
     if req.stream:
