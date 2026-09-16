@@ -139,9 +139,8 @@ def effective_context_length(config: Any, cache_pools: Any = None, last_rebuild:
 
 
 def derive_model_card(config: Any, cache_pools: Any = None, last_rebuild: Any = None) -> dict:
-    """attn enum + moe bool + ctx: the effective context length (see effective_context_length)."""
-def derive_model_card(config: Any) -> dict:
-    """attn enum + moe bool + ctx from the model config; input_modalities is what the API accepts right now."""
+    """attn enum + moe bool + ctx (the effective context length, see effective_context_length);
+    input_modalities is what the API accepts right now."""
     mc = config.model_config
     if getattr(mc, "has_linear_attention", False):
         attn = "hybrid_linear"
@@ -157,7 +156,6 @@ def derive_model_card(config: Any) -> dict:
         # getattr: derive_model_card is a metadata route -- it must never raise, and this
         # branch's own tests call it with namespace stubs that predate served_modalities.
         "input_modalities": ["text", *sorted(getattr(config, "served_modalities", ()))],
-        "input_modalities": ["text", *sorted(config.served_modalities)],
     }
 
 

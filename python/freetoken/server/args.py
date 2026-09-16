@@ -550,54 +550,6 @@ def parse_args(
     )
 
     parser.add_argument(
-        "--mm-embed-cache-device",
-        choices=["cpu", "cuda"],
-        default=MultimodalConfig.embed_cache_device,
-        help="Storage for encoded image embeddings between prefill chunks.",
-    )
-
-    parser.add_argument(
-        "--mm-encoder-weights",
-        choices=["gpu", "host"],
-        default=MultimodalConfig.encoder_weights,
-        help="Encoder tower block weights: pinned host banks streamed two blocks at a time behind the "
-        "compute (default, about 60 MiB of VRAM instead of the whole tower), or resident on the GPU.",
-    )
-
-    parser.add_argument(
-        "--allowed-media-domains",
-        type=str,
-        default=ServerArgs.allowed_media_domains,
-        help="Comma-separated hostname allowlist for client-supplied image URLs. "
-        "Empty (default) allows any domain.",
-    )
-
-    parser.add_argument(
-        "--allowed-local-media-path",
-        type=str,
-        default=ServerArgs.allowed_local_media_path,
-        help="Directory that file:// image refs may be read from. "
-        "Unset (default) rejects local files.",
-    )
-
-    parser.add_argument(
-        "--text-model-only",
-        action="store_true",
-        default=False,
-        help="Serve a multimodal checkpoint text-only: no encoder tower is built (its VRAM goes to "
-        "the KV/expert pools) and every multimodal input is rejected. Same as --mm-disable with "
-        "every encoder kind.",
-    )
-    parser.add_argument(
-        "--mm-disable",
-        nargs="+",
-        choices=list(ENCODER_KINDS),
-        default=[],
-        metavar="{vision,audio}",
-        help="Encoder towers to leave unbuilt; every input they would serve is rejected.",
-    )
-
-    parser.add_argument(
         "--image-min-tokens",
         type=_positive_int,
         default=MultimodalConfig.image_min_tokens,

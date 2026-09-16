@@ -172,7 +172,6 @@ class _DenseReader:
         if len(parts) < count or any(set(parts[i]) != expected[i] for i in parts):
             return []
         del self.pending[target]
-        self._stored.pop(target, None)
         return self._emit(target, [parts[i] for i in range(count)], stored)
 
     def missing(self) -> list[str]:
